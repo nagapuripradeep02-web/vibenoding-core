@@ -1,4 +1,12 @@
-﻿node_modules/
+node_modules/
+dist/
+*.log
 .env
-.env.*
-!.env.example
+.DS_Store
+
+# generated catalogs (do not commit)
+src/catalog/canonical.json
+httprequest-only.json
+
+
+

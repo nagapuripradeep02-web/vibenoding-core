@@ -259,3 +259,5 @@ export function getCredentialHints(nodes: N8nNode[]): Array<{
     }));
 }
 
+
+

@@ -70,6 +70,7 @@ export interface NodeConfigured {
 export interface NodeVerified {
   status: 'success' | 'failed' | 'not_run';
   executionId?: string;
+  runAt?: string;
   error?: string;
 }
 
@@ -133,6 +134,7 @@ export interface WorkflowNodeStateRow {
   user_id: string;
   connection_id: string;
   workflow_id: string;
+  node_key?: string;
   node_id: string;
   node_name: string;
   node_type: string;
@@ -142,6 +144,7 @@ export interface WorkflowNodeStateRow {
   verified: boolean;
   failed: boolean;
   last_execution_id: string | null;
+  last_run_at?: string | null;
   last_error: string | null;
   updated_at: string;
 }
@@ -168,5 +171,53 @@ export interface CredentialHint {
 export interface ValidationResult {
   isValid: boolean;
   missing: string[];
+}
+
+// Node inspect response (from /api/v3/node-inspect)
+export interface NodeInspectResponse {
+  ok: true;
+  executionId: string;
+  node: {
+    nodeId: string | null;
+    nodeName: string;
+    nodeType: string;
+  };
+  status: 'success' | 'failed' | 'not_run';
+  errorSummary: string | null; // Short error message (always populated when status === 'failed')
+  errorDetails: unknown | null; // Full sanitized error object (always populated when status === 'failed')
+  error: unknown | null; // Backward compatibility (same as errorDetails)
+  inputPreview: {
+    sources: Array<{
+      nodeName: string;
+      itemsPreview: unknown[];
+      totalItems: number;
+      truncated: boolean;
+    }>;
+    mergedPreview?: unknown[]; // Optional: flattened view
+  } | null;
+  outputPreview: {
+    itemsPreview: unknown[];
+    totalItems: number;
+    truncated: boolean;
+  } | null;
+  input: unknown | null; // Backward compatibility (may be null)
+  output: unknown | null; // Backward compatibility (may be null)
+  meta: {
+    executionId: string;
+    startedAt: string | null;
+    stoppedAt: string | null;
+  };
+  debug?: {
+    runDataKeys: string[];
+    resolvedNodeName: string;
+    topErrorNodeName: string | null;
+    topErrorMessage: string | null;
+    hasRunDataForNode: boolean;
+    mappingUsed: 'byId' | 'byName';
+    hasResultData: boolean;
+    hasRunData: boolean;
+    hasTopError: boolean;
+    subNodeName: string | null;
+  }; // Only present when EXECUTION_POLL_DEBUG=1
 }
 

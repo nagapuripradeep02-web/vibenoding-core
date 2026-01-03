@@ -15,13 +15,31 @@ const openai = new OpenAI({
 });
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // CORS middleware for browser requests
+// Dev-friendly: allow https://*.lovable.app and localhost origins.
 app.use((req: Request, res: Response, next) => {
+  const origin = req.headers.origin;
+  const originStr = typeof origin === 'string' ? origin : '';
+
+  const isLovable = /^https:\/\/.+\.lovable\.app$/i.test(originStr);
+  const isLocal =
+    /^http:\/\/localhost(:\d+)?$/i.test(originStr) ||
+    /^http:\/\/127\.0\.0\.1(:\d+)?$/i.test(originStr);
+
+  if (originStr && (isLovable || isLocal)) {
+    res.header('Access-Control-Allow-Origin', originStr);
+    res.header('Vary', 'Origin');
+  } else {
+    // Non-browser or unknown origin (curl/postman) — keep permissive for dev
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, x-user-id, X-VIBE-SIGNATURE');
+  }
+
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-user-id, X-VIBE-SIGNATURE');
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }

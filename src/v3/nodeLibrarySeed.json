@@ -1,0 +1,86 @@
+{
+  "version": "1.0.0",
+  "nodes": [
+    {
+      "node_type": "n8n-nodes-base.httpRequest",
+      "display_name": "HTTP Request",
+      "category": "core",
+      "description": "Makes HTTP requests to external APIs and web services.",
+      "docs_url": "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.httprequest/",
+      "credential_types": ["httpBasicAuth", "httpHeaderAuth", "oAuth2Api"],
+      "error_patterns": [
+        {
+          "title": "Rate Limit Exceeded",
+          "matchers": { "contains": ["rate limit", "429"] },
+          "explanation": "The external API is rejecting requests due to rate limiting.",
+          "fix_steps": "- Add a Wait node to slow down requests\n- Check the API's rate limit documentation",
+          "severity": "warning"
+        },
+        {
+          "title": "Authentication Failed",
+          "matchers": { "contains": ["unauthorized", "401"] },
+          "explanation": "API credentials are invalid or expired.",
+          "fix_steps": "- Verify your API credentials\n- Check if the key has expired",
+          "severity": "error"
+        }
+      ]
+    },
+    {
+      "node_type": "n8n-nodes-base.webhook",
+      "display_name": "Webhook",
+      "category": "trigger",
+      "description": "Receives data via HTTP webhooks from external services.",
+      "docs_url": "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/"
+    },
+    {
+      "node_type": "n8n-nodes-base.set",
+      "display_name": "Set",
+      "category": "core",
+      "description": "Sets or modifies data fields."
+    },
+    {
+      "node_type": "n8n-nodes-base.code",
+      "display_name": "Code",
+      "category": "core",
+      "description": "Executes custom JavaScript or Python code."
+    },
+    {
+      "node_type": "n8n-nodes-base.postgres",
+      "display_name": "Postgres",
+      "category": "database",
+      "description": "Interacts with PostgreSQL databases.",
+      "credential_types": ["postgres"]
+    },
+    {
+      "node_type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "display_name": "OpenAI Chat Model",
+      "category": "ai",
+      "description": "OpenAI language model for chat completions.",
+      "credential_types": ["openAiApi"],
+      "error_patterns": [
+        {
+          "title": "Rate Limit Exceeded",
+          "matchers": { "contains": ["rate limit", "429", "quota"] },
+          "explanation": "OpenAI rate limits exceeded.",
+          "fix_steps": "- Wait and retry\n- Upgrade your OpenAI plan",
+          "severity": "warning"
+        }
+      ]
+    },
+    {
+      "node_type": "@n8n/n8n-nodes-langchain.agent",
+      "display_name": "AI Agent",
+      "category": "ai",
+      "description": "Autonomous AI agent that can use tools and make decisions."
+    },
+    {
+      "node_type": "n8n-nodes-base.formTrigger",
+      "display_name": "Form Trigger",
+      "category": "trigger",
+      "description": "Starts workflow when a form is submitted."
+    }
+  ]
+}
+
+
+
