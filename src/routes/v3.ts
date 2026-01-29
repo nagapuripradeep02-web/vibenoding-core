@@ -15,6 +15,7 @@ import {
 import { decorateStateForUi } from '../v3/decorate';
 import { ensurePolling, onSubscriberConnected, onSubscriberDisconnected, pollOnce } from '../v3/executionPoller';
 import { sanitizeForResponse } from '../v3/sanitize';
+import { resolveN8nWorkflowId } from '../v3/workflowIdBridge';
 import {
   searchNodeLibrary,
   getNodeWithPatterns,
@@ -224,6 +225,10 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
 /**
  * GET /api/stream/workflow-state
  * SSE endpoint for real-time workflow state updates
+ * 
+ * Accepts either:
+ * - Supabase workflow UUID (resolved to n8n_workflow_id via database lookup)
+ * - Direct n8n workflow ID (used as-is)
  */
 router.get('/stream/workflow-state', async (req: Request, res: Response) => {
   const { connectionId, workflowId } = req.query;
@@ -235,80 +240,106 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
     });
   }
   
-  console.log(`[V3] SSE connection opened for workflow ${workflowId}`);
+  console.log(`[SSE] Connection opened for workflow ${workflowId.slice(0, 8)}...`);
   
   // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
   
+  // Resolve user first (before setting up stream)
+  const userId = await resolveUserIdForConnection(req, connectionId);
+  if (!userId) {
+    res.write(`data: ${JSON.stringify({ error: 'Unauthorized or connection not found' })}\n\n`);
+    return res.end();
+  }
+
+  // CRITICAL: Resolve Supabase UUID → n8n workflow ID ONCE at stream start
+  const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
+  if (resolveResult.ok === false) {
+    console.log(`[SSE] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
+    res.write(`data: ${JSON.stringify({ 
+      error: resolveResult.error, 
+      code: resolveResult.code,
+      workflowId 
+    })}\n\n`);
+    return res.end();
+  }
+  
+  const n8nWorkflowId = resolveResult.n8nWorkflowId;
+  console.log(`[SSE] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId}`);
+  
   // Send initial state
   try {
-    const userId = await resolveUserIdForConnection(req, connectionId);
-    if (!userId) {
-      res.write(`data: ${JSON.stringify({ error: 'Unauthorized or connection not found' })}\n\n`);
-      return res.end();
-    }
-
-    const workflowResult = await getWorkflow(connectionId, workflowId);
+    // Use resolved n8nWorkflowId for n8n API calls
+    const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
     
     if (workflowResult.data) {
-      const exec = await tryGetLatestExecution(connectionId, workflowId);
-      const baseState = buildWorkflowState(connectionId, workflowId, workflowResult.data, exec);
+      const exec = await tryGetLatestExecution(connectionId, n8nWorkflowId);
+      const baseState = buildWorkflowState(connectionId, n8nWorkflowId, workflowResult.data, exec);
       const state = decorateStateForUi(baseState);
+      
+      console.log(`[SSE] Initial state: ${state.nodes?.length || 0} nodes`);
       res.write(`data: ${JSON.stringify(state)}\n\n`);
 
       // Start poller for this workflow while SSE subscribers are connected
+      // Use n8nWorkflowId for consistency
       onSubscriberConnected({
         connectionId,
-        workflowId,
+        workflowId: n8nWorkflowId,
         userId,
         workflow: workflowResult.data,
         seedState: baseState,
       });
     } else {
-      res.write(`data: ${JSON.stringify({ error: 'Failed to fetch workflow' })}\n\n`);
+      console.log(`[SSE] n8n returned no data for workflow ${n8nWorkflowId}`);
+      res.write(`data: ${JSON.stringify({ error: 'Failed to fetch workflow from n8n', n8nWorkflowId })}\n\n`);
     }
   } catch (err) {
-    console.error('[V3] Error fetching initial state:', err);
+    console.error('[SSE] Error fetching initial state:', err);
     res.write(`data: ${JSON.stringify({ error: 'Failed to fetch initial state' })}\n\n`);
   }
   
-  // Subscribe to updates
-  const key = getWorkflowKey(connectionId, workflowId);
+  // Subscribe to updates using n8nWorkflowId
+  const key = getWorkflowKey(connectionId, n8nWorkflowId);
   const onState = (state: WorkflowState) => {
     try {
       res.write(`data: ${JSON.stringify(state)}\n\n`);
     } catch (err) {
-      console.error('[V3] Error writing to SSE stream:', err);
+      console.error('[SSE] Error writing to stream:', err);
     }
   };
   
   const unsubscribe = subscribeWorkflowState(key, onState);
   
-  // Heartbeat to keep connection alive (every 15 seconds)
+  // Heartbeat to keep connection alive (every 25 seconds)
   const heartbeat = setInterval(() => {
     try {
-      res.write(': ping\n\n');
+      res.write(':keepalive\n\n');
     } catch {
       clearInterval(heartbeat);
     }
-  }, 15000);
+  }, 25000);
   
   // Cleanup on disconnect
   req.on('close', () => {
-    console.log(`[V3] SSE connection closed for workflow ${workflowId}`);
+    console.log(`[SSE] Connection closed for workflow ${n8nWorkflowId}`);
     clearInterval(heartbeat);
     unsubscribe();
-    onSubscriberDisconnected(connectionId, workflowId);
+    onSubscriberDisconnected(connectionId, n8nWorkflowId);
   });
 });
 
 /**
  * POST /api/n8n/sync
  * Manually sync workflow state (without execution data)
+ * 
+ * Accepts either:
+ * - Supabase workflow UUID (resolved to n8n_workflow_id via database lookup)
+ * - Direct n8n workflow ID (used as-is)
  */
 router.post('/n8n/sync', async (req: Request, res: Response) => {
   try {
@@ -316,6 +347,7 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     
     if (!connectionId || !workflowId) {
       return res.status(400).json({
+        ok: false,
         error: 'Missing required fields',
         details: 'connectionId and workflowId are required',
       });
@@ -323,13 +355,33 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     
     const userId = await resolveUserIdForConnection(req, connectionId);
     if (!userId) {
-      return res.status(403).json({ error: 'Unauthorized or connection not found' });
+      return res.status(403).json({ ok: false, error: 'Unauthorized or connection not found' });
     }
     
-    console.log(`[V3] Sync requested for workflow ${workflowId}`);
+    // Resolve workflowId: if UUID, look up n8n_workflow_id from Supabase
+    const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
+    if (resolveResult.ok === false) {
+      console.log(`[sync] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
+      const statusCode = 
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
+        : resolveResult.code === 'MISSING_N8N_ID' ? 404
+        : resolveResult.code === 'USER_MISMATCH' ? 403 
+        : resolveResult.code === 'DB_ERROR' ? 500
+        : 400;
+      return res.status(statusCode).json({
+        ok: false,
+        error: resolveResult.error,
+        code: resolveResult.code,
+      });
+    }
     
-    // Fetch workflow JSON
-    const workflowResult = await getWorkflow(connectionId, workflowId);
+    const n8nWorkflowId = resolveResult.n8nWorkflowId;
+    const supabaseWorkflowId = resolveResult.supabaseWorkflowId || workflowId;
+    
+    console.log(`[sync] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId} (source: ${resolveResult.sourceTable})`);
+    
+    // Fetch workflow JSON using resolved n8n ID
+    const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
     
     if (workflowResult.error) {
       return res.status(workflowResult.error.status).json({
@@ -340,8 +392,11 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     
     const workflow = workflowResult.data as N8nWorkflow;
     
+    // Use n8nWorkflowId for all n8n API calls and internal state storage
+    // This ensures consistency across the system
+    
     // Check if workflow has changed (compare updatedAt)
-    const cacheKey = getWorkflowKey(connectionId, workflowId);
+    const cacheKey = getWorkflowKey(connectionId, n8nWorkflowId);
     const cachedTimestamp = workflowTimestampCache.get(cacheKey);
     const currentTimestamp = workflow.updatedAt || '';
     const unchanged = !!(cachedTimestamp && cachedTimestamp === currentTimestamp);
@@ -349,16 +404,17 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     // Update cache
     workflowTimestampCache.set(cacheKey, currentTimestamp);
     
-    const executionForState = await tryGetLatestExecution(connectionId, workflowId);
+    // Use n8nWorkflowId for n8n API calls
+    const executionForState = await tryGetLatestExecution(connectionId, n8nWorkflowId);
 
     // Build base state and decorate for UI
-    const baseState = buildWorkflowState(connectionId, workflowId, workflow, executionForState);
+    const baseState = buildWorkflowState(connectionId, n8nWorkflowId, workflow, executionForState);
     const state = decorateStateForUi(baseState);
-    console.log('[sync]', { connectionId, workflowId, nodesCount: state.nodes.length });
+    console.log('[sync]', { connectionId, n8nWorkflowId, nodesCount: state.nodes.length });
     
     // IMPORTANT: do not overwrite execution-derived fields (failed/verified/last_error/last_execution_id/last_run_at)
     // Sync should only update identity + configured_* fields.
-    await upsertNodeConfigStates(userId, connectionId, workflowId, baseState);
+    await upsertNodeConfigStates(userId, connectionId, n8nWorkflowId, baseState);
 
     // V3.1 Coverage Guard: Ensure all node types exist in node_library_nodes (create stubs for missing ones)
     if (process.env.NODE_LIBRARY_AUTO_STUBS !== '0') {
@@ -377,7 +433,7 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     }
 
     // V3.1: Upsert workflow nodes to link them to node library
-    await upsertWorkflowNodesFromWorkflow(connectionId, workflowId, workflow);
+    await upsertWorkflowNodesFromWorkflow(connectionId, n8nWorkflowId, workflow);
 
     // Optional: Backfill missing schemas and summaries (behind env flag)
     if (process.env.NODE_LIBRARY_BACKFILL === '1') {
@@ -404,7 +460,7 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     // Start (or refresh) execution polling for this workflow (even without SSE subscribers)
     ensurePolling({
       connectionId,
-      workflowId,
+      workflowId: n8nWorkflowId,
       userId,
       workflow,
       seedState: baseState,
@@ -434,8 +490,178 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/v3/workflows/evaluate?connectionId=...&workflowId=...
+ * Evaluate workflow for issues (blockers, warnings, info)
+ * Used by dashboard to show workflow health status
+ * 
+ * Accepts either:
+ * - Supabase workflow UUID (resolved to n8n_workflow_id via database lookup)
+ * - Direct n8n workflow ID (used as-is)
+ */
+router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
+  try {
+    const connectionId = req.query.connectionId;
+    const workflowId = req.query.workflowId;
+
+    if (!connectionId || typeof connectionId !== 'string' || !workflowId || typeof workflowId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing connectionId or workflowId',
+      });
+    }
+
+    const userId = await resolveUserIdForConnection(req, connectionId);
+    if (!userId) {
+      return res.status(403).json({
+        ok: false,
+        error: 'Unauthorized or connection not found',
+      });
+    }
+
+    // Resolve workflowId: if UUID, look up n8n_workflow_id from Supabase
+    const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
+    if (resolveResult.ok === false) {
+      console.log(`[evaluate] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
+      const statusCode = 
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
+        : resolveResult.code === 'MISSING_N8N_ID' ? 404
+        : resolveResult.code === 'USER_MISMATCH' ? 403 
+        : resolveResult.code === 'DB_ERROR' ? 500
+        : 400;
+      return res.status(statusCode).json({
+        ok: false,
+        error: resolveResult.error,
+        code: resolveResult.code,
+      });
+    }
+    
+    const n8nWorkflowId = resolveResult.n8nWorkflowId;
+    console.log(`[evaluate] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId} (source: ${resolveResult.sourceTable})`);
+
+    // Fetch workflow using resolved n8n ID
+    const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
+    if (workflowResult.error) {
+      return res.status(workflowResult.error.status).json({
+        ok: false,
+        error: workflowResult.error.message,
+      });
+    }
+
+    const workflow = workflowResult.data as N8nWorkflow;
+    
+    // Fetch latest execution to detect credential errors
+    const executionForState = await tryGetLatestExecution(connectionId, n8nWorkflowId);
+    
+    // Build workflow state using the same validation logic as sync
+    const state = buildWorkflowState(connectionId, n8nWorkflowId, workflow, executionForState);
+    
+    // Convert node states to issues format expected by frontend
+    const issues: Array<{
+      issue_code: string;
+      severity: 'blocker' | 'warning' | 'info';
+      node_locator: { node_id: string; node_name: string };
+      details: Record<string, unknown>;
+      suggested_fix?: {
+        action: string;
+        credential_alternatives?: string[];
+        required_any_of?: string[];
+        patch?: Record<string, unknown>;
+        autofix_supported?: boolean;
+      };
+    }> = [];
+
+    for (const node of state.nodes) {
+      // Skip disabled nodes
+      const workflowNode = workflow.nodes?.find(n => n.name === node.name);
+      if (workflowNode?.disabled) continue;
+
+      // Check credentials
+      if (!node.configured.credentials && node.missing.credentials.length > 0) {
+        issues.push({
+          issue_code: 'MISSING_CREDENTIALS',
+          severity: 'blocker',
+          node_locator: { node_id: node.id, node_name: node.name },
+          details: { 
+            node_type: node.type,
+            reason: node.missing.credentials.join(', '),
+          },
+          suggested_fix: {
+            action: 'attach_credential',
+            autofix_supported: false,
+          },
+        });
+      }
+
+      // Check placeholders
+      if (!node.configured.placeholders && node.missing.placeholders.length > 0) {
+        issues.push({
+          issue_code: 'PLACEHOLDER_VALUES',
+          severity: 'warning',
+          node_locator: { node_id: node.id, node_name: node.name },
+          details: { 
+            node_type: node.type,
+            placeholders: node.missing.placeholders,
+          },
+          suggested_fix: {
+            action: 'replace_placeholders',
+            autofix_supported: false,
+          },
+        });
+      }
+
+      // Check execution failures (not related to credentials)
+      if (node.verified.status === 'failed' && node.configured.credentials) {
+        issues.push({
+          issue_code: 'EXECUTION_FAILED',
+          severity: 'warning',
+          node_locator: { node_id: node.id, node_name: node.name },
+          details: { 
+            node_type: node.type,
+            error: node.verified.error || 'Unknown error',
+          },
+        });
+      }
+    }
+
+    // Count by severity
+    const blockers = issues.filter(i => i.severity === 'blocker').length;
+    const warnings = issues.filter(i => i.severity === 'warning').length;
+    const info = issues.filter(i => i.severity === 'info').length;
+
+    // Disable caching - evaluation results are dynamic and must be fresh
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    res.json({
+      ok: true,
+      ts: Date.now(), // For cache-bust verification in DevTools
+      evaluation: {
+        summary: {
+          blockers,
+          warnings,
+          info,
+          total: issues.length,
+        },
+        issues,
+      },
+    });
+  } catch (e) {
+    console.error('[evaluate] failed', e);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to evaluate workflow',
+    });
+  }
+});
+
+/**
  * POST /api/v3/workflows/:workflowId/poll?connectionId=...
  * Run exactly one execution polling cycle and return the decorated state.
+ * 
+ * Accepts either:
+ * - Supabase workflow UUID (resolved to n8n_workflow_id via database lookup)
+ * - Direct n8n workflow ID (used as-is)
  */
 router.post('/v3/workflows/:workflowId/poll', async (req: Request, res: Response) => {
   try {
@@ -451,8 +677,35 @@ router.post('/v3/workflows/:workflowId/poll', async (req: Request, res: Response
       return res.status(403).json({ error: 'Unauthorized or connection not found' });
     }
 
-    const result = await pollOnce({ connectionId, workflowId, userId });
-    res.json(result);
+    // CRITICAL: Resolve Supabase UUID → n8n workflow ID
+    const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
+    if (resolveResult.ok === false) {
+      console.log(`[poll] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
+      const statusCode = 
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
+        : resolveResult.code === 'MISSING_N8N_ID' ? 404
+        : resolveResult.code === 'USER_MISMATCH' ? 403 
+        : resolveResult.code === 'DB_ERROR' ? 500
+        : 400;
+      return res.status(statusCode).json({
+        ok: false,
+        error: resolveResult.error,
+        code: resolveResult.code,
+      });
+    }
+    
+    const n8nWorkflowId = resolveResult.n8nWorkflowId;
+    console.log(`[poll] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId}`);
+
+    // Use resolved n8nWorkflowId for polling
+    const result = await pollOnce({ connectionId, workflowId: n8nWorkflowId, userId });
+    
+    // Disable caching - poll results are dynamic and must be fresh
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    
+    res.json({ ...result, ts: Date.now() });
   } catch (e) {
     console.error('[poll] failed', e);
     res.status(500).json({ error: 'Failed to poll executions' });
@@ -1007,6 +1260,76 @@ async function upsertWorkflowNodesFromWorkflow(
 // ============================================================================
 // V3.1 Node Library Routes
 // ============================================================================
+
+/**
+ * GET /api/v3/node-library/health
+ * Connectivity check endpoint - no auth required
+ * Dashboard uses this to verify backend is reachable
+ */
+router.get('/v3/node-library/health', (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    service: 'vibenoding-core',
+    ts: Date.now(),
+  });
+});
+
+/**
+ * GET /api/v3/workflows/resolve?workflowId=...&connectionId=...
+ * DEV ONLY: Diagnostic endpoint to test workflow ID resolution
+ * Returns the resolved n8n workflow ID and source table
+ * 
+ * Guarded by NODE_ENV !== 'production' or ADMIN_API_KEY header
+ */
+router.get('/v3/workflows/resolve', async (req: Request, res: Response) => {
+  // Guard: dev-only or admin key
+  const isProduction = process.env.NODE_ENV === 'production';
+  const adminKey = req.headers['x-admin-key'] as string | undefined;
+  const expectedAdminKey = process.env.ADMIN_API_KEY;
+  
+  if (isProduction && (!expectedAdminKey || adminKey !== expectedAdminKey)) {
+    return res.status(403).json({
+      ok: false,
+      error: 'This endpoint is only available in development mode or with admin key',
+    });
+  }
+
+  const workflowId = (req.query.workflowId || req.query.workflow_id) as string | undefined;
+  const connectionId = (req.query.connectionId || req.query.connection_id) as string | undefined;
+
+  if (!workflowId || !connectionId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Missing workflowId or connectionId query parameter',
+    });
+  }
+
+  const result = await resolveN8nWorkflowId({ workflowId, connectionId });
+  
+  if (result.ok === false) {
+    const statusCode = 
+      result.code === 'WORKFLOW_NOT_FOUND' ? 404 
+      : result.code === 'MISSING_N8N_ID' ? 404
+      : result.code === 'DB_ERROR' ? 500
+      : 400;
+    return res.status(statusCode).json({
+      ok: false,
+      error: result.error,
+      code: result.code,
+      input: { workflowId, connectionId },
+    });
+  }
+
+  res.json({
+    ok: true,
+    input: { workflowId, connectionId },
+    resolved: {
+      n8nWorkflowId: result.n8nWorkflowId,
+      supabaseWorkflowId: result.supabaseWorkflowId,
+      sourceTable: result.sourceTable,
+    },
+  });
+});
 
 /**
  * GET /api/v3/node-library/search
