@@ -397,3 +397,371 @@ export async function getNodeCatalog(
   }
 }
 
+/**
+ * Make authenticated mutating request to n8n API (POST/PUT/PATCH)
+ */
+async function n8nMutate<T>(
+  credentials: ConnectionCredentials,
+  endpoint: string,
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  body?: unknown
+): Promise<ClientResult<T>> {
+  const url = `${credentials.base_url.replace(/\/$/, '')}${endpoint}`;
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'X-N8N-API-KEY': credentials.api_key_encrypted,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      const truncatedBody = errorText.length > 2000 ? errorText.slice(0, 2000) + '...(truncated)' : errorText;
+      
+      // Log full error for debugging
+      console.error(`[n8nClient] ${method} ${endpoint} failed:`, {
+        status: response.status,
+        statusText: response.statusText,
+        body: truncatedBody
+      });
+      
+      return {
+        error: {
+          status: response.status,
+          message: `n8n API error: ${response.status} ${response.statusText}`,
+          details: truncatedBody,
+        },
+      };
+    }
+
+    const data = await response.json() as T;
+    return { data };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Network error';
+    return { error: { status: 500, message: 'Failed to connect to n8n', details: message } };
+  }
+}
+
+/**
+ * Create a new workflow in n8n
+ */
+export async function createWorkflow(
+  connectionId: string,
+  workflow: Partial<N8nWorkflow>
+): Promise<ClientResult<N8nWorkflow>> {
+  const credResult = await getConnectionCredentials(connectionId);
+  if (credResult.error) return { error: credResult.error };
+
+  return n8nMutate<N8nWorkflow>(
+    credResult.data!,
+    '/api/v1/workflows',
+    'POST',
+    workflow
+  );
+}
+
+/**
+ * Delete a workflow in n8n
+ */
+export async function deleteWorkflow(
+  connectionId: string,
+  workflowId: string
+): Promise<ClientResult<void>> {
+  const credResult = await getConnectionCredentials(connectionId);
+  if (credResult.error) return { error: credResult.error };
+
+  return n8nMutate<void>(
+    credResult.data!,
+    `/api/v1/workflows/${workflowId}`,
+    'DELETE'
+  );
+}
+
+/**
+ * Result of workflow activation including verification
+ */
+export interface ActivationResult {
+  workflow: N8nWorkflow;
+  endpointUsed: string;
+  verified: boolean;
+}
+
+/**
+ * Helper: Wait for specified milliseconds
+ */
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Helper: Verify workflow activation status by fetching it
+ */
+async function verifyActivation(
+  connectionId: string,
+  workflowId: string,
+  expectedActive: boolean
+): Promise<boolean> {
+  const getResult = await getWorkflow(connectionId, workflowId);
+  if (getResult.error) {
+    console.error('[n8nClient] Verification failed - could not fetch workflow:', getResult.error);
+    return false;
+  }
+  const actualActive = getResult.data?.active === true;
+  return actualActive === expectedActive;
+}
+
+/**
+ * Activate or deactivate a workflow in n8n
+ * Multi-strategy approach:
+ * 1. Try POST /workflows/:id/activate (or /deactivate) endpoints
+ * 2. If POST succeeds but verification fails, try PUT with full workflow object
+ * 3. If POST returns 404/405, also try PUT fallback
+ */
+export async function setWorkflowActive(
+  connectionId: string,
+  workflowId: string,
+  active: boolean
+): Promise<ClientResult<ActivationResult>> {
+  const credResult = await getConnectionCredentials(connectionId);
+  if (credResult.error) return { error: credResult.error };
+
+  const debugEnabled = process.env.NODE_LIBRARY_DEBUG === '1';
+  const action = active ? 'activate' : 'deactivate';
+  
+  // STRATEGY 1: Try POST activate/deactivate endpoints
+  const postEndpoints = [
+    `/api/v1/workflows/${workflowId}/${action}`,
+    `/rest/workflows/${workflowId}/${action}`,
+  ];
+  
+  for (const endpoint of postEndpoints) {
+    console.log(`[n8nClient] Attempting ${action} via POST ${endpoint}`);
+    
+    const result = await n8nMutate<N8nWorkflow>(
+      credResult.data!,
+      endpoint,
+      'POST',
+      {} // Empty body for activate/deactivate endpoints
+    );
+    
+    // If this endpoint worked, verify the change
+    if (!result.error) {
+      console.log(`[n8nClient] POST ${endpoint} returned success`);
+      
+      // Wait for n8n to register the change
+      await delay(800);
+      
+      // Verify the workflow is actually active/inactive
+      const verified = await verifyActivation(connectionId, workflowId, active);
+      
+      if (verified) {
+        console.log(`[n8nClient] Activation verified successfully via POST ${endpoint}`);
+        return {
+          data: {
+            workflow: result.data!,
+            endpointUsed: endpoint,
+            verified: true,
+          },
+        };
+      }
+      
+      // POST succeeded but verification failed - continue to PUT fallback
+      console.warn(`[n8nClient] POST ${endpoint} succeeded but workflow not actually ${action}d - trying PUT fallback`);
+      break; // Exit POST loop, try PUT
+    }
+    
+    // If 404 or 405, this endpoint doesn't exist - try next one
+    if (result.error.status === 404 || result.error.status === 405) {
+      console.log(`[n8nClient] Endpoint ${endpoint} not supported (${result.error.status}), trying next...`);
+      continue;
+    }
+    
+    // For any other error, log but continue to try other strategies
+    console.warn(`[n8nClient] POST ${endpoint} failed:`, {
+      status: result.error.status,
+      message: result.error.message,
+    });
+  }
+  
+  // STRATEGY 2: PUT with full workflow object (active field set)
+  console.log(`[n8nClient] Trying PUT fallback with full workflow object`);
+  
+  // First, fetch the current workflow
+  const getResult = await getWorkflow(connectionId, workflowId);
+  if (getResult.error) {
+    console.error('[n8nClient] Failed to fetch workflow for PUT fallback:', getResult.error);
+    return { error: getResult.error };
+  }
+  
+  const workflow = getResult.data!;
+  
+  // Check if already in desired state
+  if (workflow.active === active) {
+    console.log(`[n8nClient] Workflow already ${active ? 'active' : 'inactive'}`);
+    return {
+      data: {
+        workflow,
+        endpointUsed: 'already_in_state',
+        verified: true,
+      },
+    };
+  }
+  
+  // Build complete payload with active status changed
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const updatePayload: Record<string, any> = {
+    name: workflow.name,
+    nodes: workflow.nodes,
+    connections: workflow.connections,
+    active: active, // The key change
+  };
+  
+  // Include optional fields only if defined (don't send undefined)
+  if (workflow.settings !== undefined) updatePayload.settings = workflow.settings;
+  if (workflow.staticData !== undefined) updatePayload.staticData = workflow.staticData;
+  // Note: Don't include id, createdAt, updatedAt, versionId, shared (read-only)
+  
+  const putEndpoints = [
+    `/api/v1/workflows/${workflowId}`,
+    `/rest/workflows/${workflowId}`,
+  ];
+  
+  for (const endpoint of putEndpoints) {
+    console.log(`[n8nClient] Attempting ${action} via PUT ${endpoint}`);
+    
+    const putResult = await n8nMutate<N8nWorkflow>(
+      credResult.data!,
+      endpoint,
+      'PUT',
+      updatePayload
+    );
+    
+    if (!putResult.error) {
+      console.log(`[n8nClient] PUT ${endpoint} returned success`);
+      
+      // Wait and verify
+      await delay(800);
+      const verified = await verifyActivation(connectionId, workflowId, active);
+      
+      if (verified) {
+        console.log(`[n8nClient] Activation verified successfully via PUT ${endpoint}`);
+      } else {
+        console.warn(`[n8nClient] PUT succeeded but verification failed`);
+      }
+      
+      return {
+        data: {
+          workflow: putResult.data!,
+          endpointUsed: endpoint,
+          verified,
+        },
+      };
+    }
+    
+    // If 404 or 405, try next endpoint
+    if (putResult.error.status === 404 || putResult.error.status === 405) {
+      console.log(`[n8nClient] PUT ${endpoint} not supported (${putResult.error.status}), trying next...`);
+      continue;
+    }
+    
+    // For other errors, log and continue
+    console.error(`[n8nClient] PUT ${endpoint} failed:`, {
+      status: putResult.error.status,
+      message: putResult.error.message,
+      details: putResult.error.details?.slice(0, 500),
+    });
+  }
+  
+  // All strategies failed
+  return {
+    error: {
+      status: 500,
+      message: `All activation strategies failed for workflow ${workflowId}`,
+      details: `Tried POST ${postEndpoints.join(', ')} and PUT ${putEndpoints.join(', ')}`,
+    },
+  };
+}
+
+/**
+ * Get connection base URL (without /api/v1)
+ */
+export async function getConnectionBaseUrl(connectionId: string): Promise<ClientResult<string>> {
+  const credResult = await getConnectionCredentials(connectionId);
+  if (credResult.error) return { error: credResult.error };
+
+  const baseUrl = credResult.data!.base_url.replace(/\/$/, '');
+  // Strip /api/v1 if present
+  const cleanUrl = baseUrl.endsWith('/api/v1') 
+    ? baseUrl.slice(0, -7) 
+    : baseUrl;
+
+  return { data: cleanUrl };
+}
+
+/**
+ * Invoke an n8n webhook URL and measure latency
+ */
+export interface WebhookInvocationResult {
+  status: number;
+  data: unknown;
+  latencyMs: number;
+  error?: string;
+}
+
+export async function invokeWebhook(
+  baseUrl: string,
+  webhookPath: string,
+  payload: unknown,
+  headers?: Record<string, string>
+): Promise<WebhookInvocationResult> {
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  const url = `${cleanBase}/webhook/${webhookPath}`;
+
+  const startTime = Date.now();
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const latencyMs = Date.now() - startTime;
+    
+    let data: unknown;
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/json')) {
+      try {
+        data = await response.json();
+      } catch {
+        data = await response.text();
+      }
+    } else {
+      data = await response.text();
+    }
+
+    return {
+      status: response.status,
+      data,
+      latencyMs,
+      error: response.ok ? undefined : `HTTP ${response.status}`,
+    };
+  } catch (err) {
+    const latencyMs = Date.now() - startTime;
+    return {
+      status: 0,
+      data: null,
+      latencyMs,
+      error: err instanceof Error ? err.message : 'Network error',
+    };
+  }
+}

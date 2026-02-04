@@ -9,6 +9,10 @@ import { listWorkflows } from './n8n';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Disable ETag generation globally - prevents 304 responses for API endpoints
+// This ensures dynamic endpoints like /evaluate always return fresh 200 responses
+app.set('etag', false);
+
 // Initialize OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -38,7 +42,7 @@ app.use((req: Request, res: Response, next) => {
   }
 
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-user-id, X-VIBE-SIGNATURE');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey, x-user-id, X-VIBE-SIGNATURE');
 
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);

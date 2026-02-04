@@ -67,10 +67,33 @@ export function detectPlaceholders(node: N8nNode): ValidationResult {
 
 /**
  * Check if node has credentials attached
+ * 
+ * @param node - The workflow node to check
+ * @param executionError - Optional execution error to check for credential failures
  */
-export function credentialsAttached(node: N8nNode): ValidationResult {
+export function credentialsAttached(node: N8nNode, executionError?: string): ValidationResult {
   const credentials = node.credentials;
   const missing: string[] = [];
+  
+  // CRITICAL: Check execution error for deleted/invalid credentials FIRST
+  // This catches cases where node.credentials exists but the credential was deleted in n8n
+  if (executionError) {
+    const errorLower = executionError.toLowerCase();
+    const hasCredentialError = 
+      errorLower.includes('credential with id') && errorLower.includes('does not exist') ||
+      errorLower.includes('credentials are not set') ||
+      errorLower.includes('credentials could not be loaded') ||
+      errorLower.includes('credential not found') ||
+      errorLower.includes('invalid credential');
+    
+    if (hasCredentialError) {
+      missing.push(`Credential error: ${executionError.substring(0, 100)}`);
+      return {
+        isValid: false,
+        missing,
+      };
+    }
+  }
   
   // Check if credentials object exists and has entries
   if (!credentials || Object.keys(credentials).length === 0) {
@@ -225,14 +248,17 @@ export function requiredFieldsMissing(node: N8nNode): ValidationResult {
 
 /**
  * Combined validation for a node
+ * 
+ * @param node - The workflow node to validate
+ * @param executionError - Optional execution error to check for credential failures
  */
-export function validateNode(node: N8nNode): {
+export function validateNode(node: N8nNode, executionError?: string): {
   credentials: ValidationResult;
   placeholders: ValidationResult;
   requiredFields: ValidationResult;
 } {
   return {
-    credentials: credentialsAttached(node),
+    credentials: credentialsAttached(node, executionError),
     placeholders: detectPlaceholders(node),
     requiredFields: requiredFieldsMissing(node),
   };

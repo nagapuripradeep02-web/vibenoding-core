@@ -10,9 +10,12 @@ export interface N8nWorkflow {
   nodes: N8nNode[];
   connections: N8nConnections;
   settings?: Record<string, unknown>;
+  staticData?: unknown;
   createdAt?: string;
   updatedAt?: string;
+  versionId?: string;
   tags?: Array<{ id: string; name: string }>;
+  shared?: unknown;
 }
 
 export interface N8nNode {

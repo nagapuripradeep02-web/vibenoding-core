@@ -270,7 +270,10 @@ export async function upsertWorkflowNodes(
     node_id: n.node_id,
     node_name: n.node_name,
     node_type: n.node_type,
-    node_type_version: n.node_type_version !== undefined ? n.node_type_version : null,
+    // Truncate typeVersion to integer (langchain nodes use decimals like 1.1, but DB column is INTEGER)
+    node_type_version: n.node_type_version !== undefined && n.node_type_version !== null 
+      ? Math.floor(n.node_type_version) 
+      : null,
     node_package_version: n.node_package_version !== undefined ? n.node_package_version : null,
     is_subnode: n.is_subnode || false,
     params_summary: n.params_summary || null,

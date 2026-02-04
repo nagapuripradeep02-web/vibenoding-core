@@ -1,4 +1,4 @@
-﻿/**
+/**
  * V3.0 Workflow State Builder
  * Computes per-node configuration status and verification state
  */
@@ -192,8 +192,10 @@ export function buildWorkflowState(
   const executionRunAt = execution ? (execution.stoppedAt || execution.startedAt) : undefined;
 
   const nodeStates: NodeState[] = nodes.map((node) => {
-    const validation = validateNode(node);
     const execResult = nodeExecutionResults.get(node.name);
+    
+    // Pass execution error to validation so it can detect deleted/invalid credentials
+    const validation = validateNode(node, execResult?.error);
 
     const configured = {
       credentials: validation.credentials.isValid,
