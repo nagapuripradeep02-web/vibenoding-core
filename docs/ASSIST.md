@@ -96,6 +96,90 @@ Ask a question about a specific workflow.
 
 ---
 
+### POST `/api/v3/assist/plan`
+
+Generate a structured fix plan for a workflow. **Phase 2B Step 1: plan generation only, no patching.**
+
+**Request Body:**
+```json
+{
+  "connectionId": "uuid",
+  "workflowUuid": "uuid",
+  "analyzed_source": "prod",  // optional: "prod" | "test", default "prod"
+  "userGoal": "Fix authentication issues"  // optional: focus the plan
+}
+```
+
+**Response (Success):**
+```json
+{
+  "ok": true,
+  "plan": {
+    "id": "uuid",
+    "created_at": "2026-02-06T00:00:00.000Z",
+    "phases": [
+      {
+        "id": "phase_auth",
+        "title": "Fix Authentication",
+        "steps": [
+          {
+            "id": "step_1",
+            "title": "Add OAuth credentials to Google Sheets node",
+            "nodeLocators": ["Google Sheets"],
+            "checks": ["Node has no credentials configured"],
+            "actions": ["Go to Settings > Credentials", "Add OAuth2 credentials"],
+            "expectedOutcome": "Node shows green credential indicator",
+            "rollback": "Remove the credential from node settings",
+            "rank": 1
+          }
+        ]
+      }
+    ],
+    "safety": {
+      "reversible": true,
+      "affectsProduction": false,
+      "requiresCredentials": true
+    }
+  },
+  "debug": {
+    "workflow_uuid": "C7S1qwmGaMEI3ngP",
+    "analyzed_source": "prod",
+    "n8n_workflow_id": "C7S1qwmGaMEI3ngP",
+    "budgets": {
+      "max_tokens": 4000,
+      "max_tool_calls": 1,
+      "max_seconds": 60,
+      "temperature": 0
+    },
+    "timings_ms": {
+      "total": 3500,
+      "fetch_workflow": 200,
+      "resolve_schemas": 0,
+      "analyze": 100,
+      "llm": 3200
+    }
+  }
+}
+```
+
+**Response (Error):**
+```json
+{
+  "ok": false,
+  "error": "Invalid plan format from LLM",
+  "plan": null,
+  "debug": { "budgets": {...}, "timings_ms": {...} }
+}
+```
+
+**Key Features:**
+- **Deterministic**: Always uses `temperature=0`
+- **Server-generated IDs**: `plan.id` and `plan.created_at` are set by the server, not trusted from LLM
+- **DB Persistence**: Creates `completion_plans` row (one active per workflow) and `completion_steps` rows
+- **Stable ordering**: Steps sorted by `rank`, then `id` for reproducibility
+
+---
+
 ## Configuration
 
 ### Required Environment Variables
@@ -374,10 +458,17 @@ if (failedNode === 'Unknown') {
 - ✅ Safety guardrails
 - ✅ Doctor test
 
+### Phase 2B (Plan Mode)
+- ✅ Plan mode endpoint (`/api/v3/assist/plan`)
+- ✅ Structured fix plans with phases and steps
+- ✅ DB persistence (completion_plans, completion_steps)
+- ✅ Deterministic mode (temperature=0)
+- ✅ Server-generated plan IDs (security)
+- ✅ Doctor test for Plan endpoint
+
 ### Phase 3 (Future)
 - [ ] Citations (extract node names mentioned in answers)
 - [ ] Conversation history / multi-turn
-- [ ] Plan mode (generate step-by-step fixes)
 - [ ] Agent mode (execute fixes automatically)
 - [ ] Support for other LLM providers (Anthropic, local models)
 - [ ] Enhanced schema resolution from node library

@@ -12,6 +12,7 @@ import {
   getConnectionUserId,
   createWorkflow,
   deleteWorkflow,
+  updateWorkflow,
   setWorkflowActive,
   getConnectionBaseUrl,
   invokeWebhook,
@@ -35,6 +36,55 @@ import {
   parseAssistResponse,
 } from '../v3/assistValidation';
 import type { AssistResponse } from '../v3/assistValidation';
+import {
+  ASK_BUDGETS,
+  createEmptyTimings,
+  createEmptyDebug,
+} from '../v3/askContract';
+import type {
+  AskIssue,
+  AskCitation,
+  AskDebug,
+  AskContractResponse,
+  TopFixFirst,
+  AskTimings,
+} from '../v3/askContract';
+import {
+  rankIssues,
+  buildTopFixFirst,
+  convertLegacyIssue,
+} from '../v3/askRanker';
+import {
+  PLAN_BUDGETS,
+  createEmptyPlanTimings,
+  createEmptyPlanDebug,
+  sortPlanForDeterminism,
+} from '../v3/planContract';
+import type {
+  Plan,
+  PlanDebug,
+  PlanContractResponse,
+} from '../v3/planContract';
+import {
+  buildPlanSystemPrompt,
+  buildPlanUserContext,
+  parsePlanResponse,
+  extractStableOrderSignature,
+} from '../v3/planContext';
+import {
+  APPLY_STEP_BUDGETS,
+  createEmptyApplyStepDebug,
+  createEmptyApplyStepTimings,
+  validatePatchOperations,
+} from '../v3/applyStepContract';
+import type { ApplyStepResponse, ApplyStepDebug } from '../v3/applyStepContract';
+import {
+  buildPatchPrompt,
+  parsePatchResponse,
+  applyPatchToWorkflow,
+  computeDiffSummary,
+  prepareWorkflowForUpdate,
+} from '../v3/applyStepPatcher';
 import { callLLM, estimateTokens, truncateToTokens } from '../llm/router';
 import { buildWorkflowState, mergeExecutionIntoState } from '../v3/workflowState';
 import {
@@ -111,7 +161,7 @@ async function analyzeExecutionHealth(
 
   try {
     console.log(`[analyzeExecutionHealth] Fetching 20 recent executions for workflow ${n8nWorkflowId}`);
-    
+
     const executionsResult = await listRecentExecutions(connectionId, n8nWorkflowId, 20, {
       includeData: false, // Don't need full data for health check
     });
@@ -241,20 +291,20 @@ async function syncWorkflowIfChanged(
   const cachedTimestamp = workflowTimestampCache.get(cacheKey);
   const currentTimestamp = workflow.updatedAt || '';
   const unchanged = !!(cachedTimestamp && cachedTimestamp === currentTimestamp);
-  
+
   if (!unchanged) {
     console.log(`[syncWorkflowIfChanged] Workflow changed, syncing nodes to DB`);
-    
+
     // Update cache
     workflowTimestampCache.set(cacheKey, currentTimestamp);
-    
+
     // Sync nodes to database
     const executionForState = await tryGetLatestExecution(connectionId, n8nWorkflowId);
     const baseState = buildWorkflowState(connectionId, n8nWorkflowId, workflow, executionForState);
-    
+
     // Update node config states
     await upsertNodeConfigStates(userId, connectionId, n8nWorkflowId, baseState);
-    
+
     // Ensure node library coverage
     if (process.env.NODE_LIBRARY_AUTO_STUBS !== '0') {
       try {
@@ -266,11 +316,11 @@ async function syncWorkflowIfChanged(
         console.warn('[syncWorkflowIfChanged] Node library coverage error (non-fatal):', e);
       }
     }
-    
+
     // Upsert workflow nodes
     await upsertWorkflowNodesFromWorkflow(connectionId, n8nWorkflowId, workflow);
   }
-  
+
   return {
     synced: !unchanged,
     workflowUpdatedAt: currentTimestamp,
@@ -368,7 +418,7 @@ function validateSignature(req: Request): boolean {
     console.warn('[V3] VIBE_EXEC_EVENTS_SECRET not configured');
     return false;
   }
-  
+
   const signature = req.headers['x-vibe-signature'];
   return signature === secret;
 }
@@ -383,9 +433,9 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
     if (!validateSignature(req)) {
       return res.status(401).json({ error: 'Invalid or missing X-VIBE-SIGNATURE header' });
     }
-    
+
     const payload = req.body as ExecutionEventPayload;
-    
+
     // Validate required fields
     if (!payload.connectionId || !payload.workflowId || !payload.executionId || !payload.status) {
       return res.status(400).json({
@@ -393,15 +443,15 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
         details: 'connectionId, workflowId, executionId, and status are required',
       });
     }
-    
+
     console.log(`[V3] Execution event received: ${payload.status} for workflow ${payload.workflowId}`);
-    
+
     // Get user_id from connection
     const userId = await getConnectionUserId(payload.connectionId);
     if (!userId) {
       return res.status(404).json({ error: 'Connection not found' });
     }
-    
+
     // Insert into execution_events table
     const { error: insertError } = await supabaseAdmin
       .from('execution_events')
@@ -413,23 +463,23 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
         status: payload.status,
         meta: payload.meta || {},
       });
-    
+
     if (insertError) {
       console.error('[V3] Failed to insert execution event:', insertError);
       // Continue anyway - we still want to update state
     }
-    
+
     // Fetch execution details from n8n
     const execResult = await getExecution(payload.connectionId, payload.executionId);
-    
+
     // Fetch workflow JSON
     const workflowResult = await getWorkflow(payload.connectionId, payload.workflowId);
-    
+
     if (workflowResult.error) {
       console.error('[V3] Failed to fetch workflow:', workflowResult.error);
       return res.status(502).json({ error: 'Failed to fetch workflow from n8n' });
     }
-    
+
     // Build workflow state
     const state = buildWorkflowState(
       payload.connectionId,
@@ -437,14 +487,14 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
       workflowResult.data!,
       execResult.data || null
     );
-    
+
     // Upsert workflow_node_state rows
     await upsertNodeStates(userId, payload.connectionId, payload.workflowId, state, payload.executionId);
-    
+
     // Publish to SSE subscribers (UI-decorated)
     const key = getWorkflowKey(payload.connectionId, payload.workflowId);
     publishWorkflowState(key, decorateStateForUi(state));
-    
+
     res.json({ ok: true });
   } catch (error) {
     console.error('[V3] Error processing execution event:', error);
@@ -463,16 +513,16 @@ router.post('/n8n/execution-events', async (req: Request, res: Response) => {
  */
 router.get('/stream/workflow-state', async (req: Request, res: Response) => {
   const { connectionId, workflowId } = req.query;
-  
+
   if (!connectionId || !workflowId || typeof connectionId !== 'string' || typeof workflowId !== 'string') {
     return res.status(400).json({
       error: 'Missing required query parameters',
       details: 'connectionId and workflowId are required',
     });
   }
-  
+
   console.log(`[SSE] Connection opened for workflow ${workflowId.slice(0, 8)}...`);
-  
+
   // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -480,7 +530,7 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
-  
+
   // Resolve user first (before setting up stream)
   const userId = await resolveUserIdForConnection(req, connectionId);
   if (!userId) {
@@ -492,27 +542,27 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
   const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
   if (resolveResult.ok === false) {
     console.log(`[SSE] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
-    res.write(`data: ${JSON.stringify({ 
-      error: resolveResult.error, 
+    res.write(`data: ${JSON.stringify({
+      error: resolveResult.error,
       code: resolveResult.code,
-      workflowId 
+      workflowId
     })}\n\n`);
     return res.end();
   }
-  
+
   const n8nWorkflowId = resolveResult.n8nWorkflowId;
   console.log(`[SSE] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId}`);
-  
+
   // Send initial state
   try {
     // Use resolved n8nWorkflowId for n8n API calls
     const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
-    
+
     if (workflowResult.data) {
       const exec = await tryGetLatestExecution(connectionId, n8nWorkflowId);
       const baseState = buildWorkflowState(connectionId, n8nWorkflowId, workflowResult.data, exec);
       const state = decorateStateForUi(baseState);
-      
+
       console.log(`[SSE] Initial state: ${state.nodes?.length || 0} nodes`);
       res.write(`data: ${JSON.stringify(state)}\n\n`);
 
@@ -533,7 +583,7 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
     console.error('[SSE] Error fetching initial state:', err);
     res.write(`data: ${JSON.stringify({ error: 'Failed to fetch initial state' })}\n\n`);
   }
-  
+
   // Subscribe to updates using n8nWorkflowId
   const key = getWorkflowKey(connectionId, n8nWorkflowId);
   const onState = (state: WorkflowState) => {
@@ -543,9 +593,9 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
       console.error('[SSE] Error writing to stream:', err);
     }
   };
-  
+
   const unsubscribe = subscribeWorkflowState(key, onState);
-  
+
   // Heartbeat to keep connection alive (every 25 seconds)
   const heartbeat = setInterval(() => {
     try {
@@ -554,7 +604,7 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
       clearInterval(heartbeat);
     }
   }, 25000);
-  
+
   // Cleanup on disconnect
   req.on('close', () => {
     console.log(`[SSE] Connection closed for workflow ${n8nWorkflowId}`);
@@ -575,7 +625,7 @@ router.get('/stream/workflow-state', async (req: Request, res: Response) => {
 router.post('/n8n/sync', async (req: Request, res: Response) => {
   try {
     const { connectionId, workflowId } = req.body;
-    
+
     if (!connectionId || !workflowId) {
       return res.status(400).json({
         ok: false,
@@ -583,58 +633,58 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
         details: 'connectionId and workflowId are required',
       });
     }
-    
+
     const userId = await resolveUserIdForConnection(req, connectionId);
     if (!userId) {
       return res.status(403).json({ ok: false, error: 'Unauthorized or connection not found' });
     }
-    
+
     // Resolve workflowId: if UUID, look up n8n_workflow_id from Supabase
     const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
     if (resolveResult.ok === false) {
       console.log(`[sync] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
-      const statusCode = 
-        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
-        : resolveResult.code === 'MISSING_N8N_ID' ? 404
-        : resolveResult.code === 'USER_MISMATCH' ? 403 
-        : resolveResult.code === 'DB_ERROR' ? 500
-        : 400;
+      const statusCode =
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404
+          : resolveResult.code === 'MISSING_N8N_ID' ? 404
+            : resolveResult.code === 'USER_MISMATCH' ? 403
+              : resolveResult.code === 'DB_ERROR' ? 500
+                : 400;
       return res.status(statusCode).json({
         ok: false,
         error: resolveResult.error,
         code: resolveResult.code,
       });
     }
-    
+
     const n8nWorkflowId = resolveResult.n8nWorkflowId;
     const supabaseWorkflowId = resolveResult.supabaseWorkflowId || workflowId;
-    
+
     console.log(`[sync] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId} (source: ${resolveResult.sourceTable})`);
-    
+
     // Fetch workflow JSON using resolved n8n ID
     const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
-    
+
     if (workflowResult.error) {
       return res.status(workflowResult.error.status).json({
         error: workflowResult.error.message,
         details: workflowResult.error.details,
       });
     }
-    
+
     const workflow = workflowResult.data as N8nWorkflow;
-    
+
     // Use n8nWorkflowId for all n8n API calls and internal state storage
     // This ensures consistency across the system
-    
+
     // Check if workflow has changed (compare updatedAt)
     const cacheKey = getWorkflowKey(connectionId, n8nWorkflowId);
     const cachedTimestamp = workflowTimestampCache.get(cacheKey);
     const currentTimestamp = workflow.updatedAt || '';
     const unchanged = !!(cachedTimestamp && cachedTimestamp === currentTimestamp);
-    
+
     // Update cache
     workflowTimestampCache.set(cacheKey, currentTimestamp);
-    
+
     // Use n8nWorkflowId for n8n API calls
     const executionForState = await tryGetLatestExecution(connectionId, n8nWorkflowId);
 
@@ -642,7 +692,7 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
     const baseState = buildWorkflowState(connectionId, n8nWorkflowId, workflow, executionForState);
     const state = decorateStateForUi(baseState);
     console.log('[sync]', { connectionId, n8nWorkflowId, nodesCount: state.nodes.length });
-    
+
     // IMPORTANT: do not overwrite execution-derived fields (failed/verified/last_error/last_execution_id/last_run_at)
     // Sync should only update identity + configured_* fields.
     await upsertNodeConfigStates(userId, connectionId, n8nWorkflowId, baseState);
@@ -697,7 +747,7 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
       seedState: baseState,
       reason: 'sync',
     });
-    
+
     // Sync node catalog to ensure real schemas (throttled: once per connection per 5 minutes)
     const lastRepairTime = repairThrottle.get(connectionId) || 0;
     const now = Date.now();
@@ -708,10 +758,10 @@ router.post('/n8n/sync', async (req: Request, res: Response) => {
         console.warn('[sync] Catalog sync failed (non-fatal):', e instanceof Error ? e.message : 'Unknown error');
       });
     }
-    
+
     // Publish to SSE subscribers
     publishWorkflowState(cacheKey, state as any);
-    
+
     res.json({ ok: true, unchanged, state });
   } catch (error) {
     console.error('[V3] Error syncing workflow:', error);
@@ -753,19 +803,19 @@ router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
     const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
     if (resolveResult.ok === false) {
       console.log(`[evaluate] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
-      const statusCode = 
-        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
-        : resolveResult.code === 'MISSING_N8N_ID' ? 404
-        : resolveResult.code === 'USER_MISMATCH' ? 403 
-        : resolveResult.code === 'DB_ERROR' ? 500
-        : 400;
+      const statusCode =
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404
+          : resolveResult.code === 'MISSING_N8N_ID' ? 404
+            : resolveResult.code === 'USER_MISMATCH' ? 403
+              : resolveResult.code === 'DB_ERROR' ? 500
+                : 400;
       return res.status(statusCode).json({
         ok: false,
         error: resolveResult.error,
         code: resolveResult.code,
       });
     }
-    
+
     const n8nWorkflowId = resolveResult.n8nWorkflowId;
     console.log(`[evaluate] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId} (source: ${resolveResult.sourceTable})`);
 
@@ -779,13 +829,13 @@ router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
     }
 
     const workflow = workflowResult.data as N8nWorkflow;
-    
+
     // Fetch latest execution to detect credential errors
     const executionForState = await tryGetLatestExecution(connectionId, n8nWorkflowId);
-    
+
     // Build workflow state using the same validation logic as sync
     const state = buildWorkflowState(connectionId, n8nWorkflowId, workflow, executionForState);
-    
+
     // Convert node states to issues format expected by frontend
     const issues: Array<{
       issue_code: string;
@@ -812,7 +862,7 @@ router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
           issue_code: 'MISSING_CREDENTIALS',
           severity: 'blocker',
           node_locator: { node_id: node.id, node_name: node.name },
-          details: { 
+          details: {
             node_type: node.type,
             reason: node.missing.credentials.join(', '),
           },
@@ -829,7 +879,7 @@ router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
           issue_code: 'PLACEHOLDER_VALUES',
           severity: 'warning',
           node_locator: { node_id: node.id, node_name: node.name },
-          details: { 
+          details: {
             node_type: node.type,
             placeholders: node.missing.placeholders,
           },
@@ -846,7 +896,7 @@ router.get('/v3/workflows/evaluate', async (req: Request, res: Response) => {
           issue_code: 'EXECUTION_FAILED',
           severity: 'warning',
           node_locator: { node_id: node.id, node_name: node.name },
-          details: { 
+          details: {
             node_type: node.type,
             error: node.verified.error || 'Unknown error',
           },
@@ -912,30 +962,30 @@ router.post('/v3/workflows/:workflowId/poll', async (req: Request, res: Response
     const resolveResult = await resolveN8nWorkflowId({ workflowId, connectionId, userId });
     if (resolveResult.ok === false) {
       console.log(`[poll] Failed to resolve workflowId: ${resolveResult.code} - ${resolveResult.error}`);
-      const statusCode = 
-        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404 
-        : resolveResult.code === 'MISSING_N8N_ID' ? 404
-        : resolveResult.code === 'USER_MISMATCH' ? 403 
-        : resolveResult.code === 'DB_ERROR' ? 500
-        : 400;
+      const statusCode =
+        resolveResult.code === 'WORKFLOW_NOT_FOUND' ? 404
+          : resolveResult.code === 'MISSING_N8N_ID' ? 404
+            : resolveResult.code === 'USER_MISMATCH' ? 403
+              : resolveResult.code === 'DB_ERROR' ? 500
+                : 400;
       return res.status(statusCode).json({
         ok: false,
         error: resolveResult.error,
         code: resolveResult.code,
       });
     }
-    
+
     const n8nWorkflowId = resolveResult.n8nWorkflowId;
     console.log(`[poll] Resolved: ${workflowId.slice(0, 8)}... → ${n8nWorkflowId}`);
 
     // Use resolved n8nWorkflowId for polling
     const result = await pollOnce({ connectionId, workflowId: n8nWorkflowId, userId });
-    
+
     // Disable caching - poll results are dynamic and must be fresh
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    
+
     res.json({ ...result, ts: Date.now() });
   } catch (e) {
     console.error('[poll] failed', e);
@@ -1150,7 +1200,7 @@ router.get('/v3/node-inspect', async (req: Request, res: Response) => {
         .eq('workflow_id', workflowId)
         .eq('node_key', effectiveNodeKey)
         .single();
-      
+
       if (stateData?.last_execution_id) {
         effectiveExecutionId = stateData.last_execution_id;
       } else {
@@ -1250,12 +1300,12 @@ router.get('/v3/node-inspect', async (req: Request, res: Response) => {
           typeof errorObj === 'string'
             ? errorObj.slice(0, 200)
             : (errorObj as any)?.message ||
-              (Array.isArray((errorObj as any)?.messages) &&
+            (Array.isArray((errorObj as any)?.messages) &&
               typeof (errorObj as any).messages[0] === 'string'
-                ? (errorObj as any).messages[0]
-                : null) ||
-              (errorObj as any)?.name ||
-              'Execution failed';
+              ? (errorObj as any).messages[0]
+              : null) ||
+            (errorObj as any)?.name ||
+            'Execution failed';
       }
       // Fallback: if errorSummary is still empty, use errorDetails.message
       if (!errorSummary && errorDetails) {
@@ -1309,27 +1359,27 @@ router.get('/v3/node-inspect', async (req: Request, res: Response) => {
 router.get('/n8n/workflow-state', async (req: Request, res: Response) => {
   try {
     const { connectionId, workflowId } = req.query;
-    
+
     if (!connectionId || !workflowId || typeof connectionId !== 'string' || typeof workflowId !== 'string') {
       return res.status(400).json({
         error: 'Missing required query parameters',
         details: 'connectionId and workflowId are required',
       });
     }
-    
+
     // Fetch workflow JSON
     const workflowResult = await getWorkflow(connectionId, workflowId);
-    
+
     if (workflowResult.error) {
       return res.status(workflowResult.error.status).json({
         error: workflowResult.error.message,
         details: workflowResult.error.details,
       });
     }
-    
+
     // Build state
     const state = buildWorkflowState(connectionId, workflowId, workflowResult.data!);
-    
+
     res.json(state);
   } catch (error) {
     console.error('[V3] Error getting workflow state:', error);
@@ -1369,7 +1419,7 @@ async function upsertNodeStates(
     last_error: node.verified.error || null,
     updated_at: new Date().toISOString(),
   }));
-  
+
   // Upsert each node state
   if (rows.length > 0) {
     console.log('[V3] upsert sample', { node_id: rows[0].node_id, node_key: rows[0].node_key, node_name: rows[0].node_name });
@@ -1381,7 +1431,7 @@ async function upsertNodeStates(
         // IMPORTANT: match your actual UNIQUE constraint
         onConflict: 'connection_id,workflow_id,node_key',
       });
-    
+
     if (error) {
       console.error(`[V3] Failed to upsert node state for ${row.node_name}:`, error);
     }
@@ -1412,14 +1462,14 @@ async function upsertNodeConfigStates(
     // DO NOT include: verified, failed, last_execution_id, last_error, last_run_at
     updated_at: new Date().toISOString(),
   }));
-  
+
   for (const row of rows) {
     const { error } = await supabaseAdmin
       .from('workflow_node_state')
       .upsert(row, {
         onConflict: 'connection_id,workflow_id,node_key',
       });
-    
+
     if (error) {
       console.error(`[V3] Failed to upsert node config for ${row.node_name}:`, error);
     }
@@ -1452,7 +1502,7 @@ async function upsertWorkflowNodesFromWorkflow(
   // Fetch node schemas for better summarization (batch fetch)
   const nodeTypes = [...new Set(workflow.nodes.map((n) => n.type).filter(Boolean))];
   const schemaMap = new Map<string, Record<string, unknown>>();
-  
+
   for (const nodeType of nodeTypes) {
     const defResult = await getNodeDefinition(nodeType);
     if (defResult.data?.config_schema) {
@@ -1517,7 +1567,7 @@ router.get('/v3/workflows/resolve', async (req: Request, res: Response) => {
   const isProduction = process.env.NODE_ENV === 'production';
   const adminKey = req.headers['x-admin-key'] as string | undefined;
   const expectedAdminKey = process.env.ADMIN_API_KEY;
-  
+
   if (isProduction && (!expectedAdminKey || adminKey !== expectedAdminKey)) {
     return res.status(403).json({
       ok: false,
@@ -1536,13 +1586,13 @@ router.get('/v3/workflows/resolve', async (req: Request, res: Response) => {
   }
 
   const result = await resolveN8nWorkflowId({ workflowId, connectionId });
-  
+
   if (result.ok === false) {
-    const statusCode = 
-      result.code === 'WORKFLOW_NOT_FOUND' ? 404 
-      : result.code === 'MISSING_N8N_ID' ? 404
-      : result.code === 'DB_ERROR' ? 500
-      : 400;
+    const statusCode =
+      result.code === 'WORKFLOW_NOT_FOUND' ? 404
+        : result.code === 'MISSING_N8N_ID' ? 404
+          : result.code === 'DB_ERROR' ? 500
+            : 400;
     return res.status(statusCode).json({
       ok: false,
       error: result.error,
@@ -1638,7 +1688,7 @@ router.post('/v3/node-library/sync-catalog', async (req: Request, res: Response)
     const refresh = req.query.refresh === 'true';
 
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/64a46d96-58fd-4c47-936c-eca813d7ba71',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'routes/v3.ts:1078',message:'sync-catalog route called',data:{connectionId,refresh},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/64a46d96-58fd-4c47-936c-eca813d7ba71', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: 'routes/v3.ts:1078', message: 'sync-catalog route called', data: { connectionId, refresh }, timestamp: Date.now(), sessionId: 'debug-session', runId: 'run1', hypothesisId: 'A' }) }).catch(() => { });
     // #endregion
 
     if (typeof connectionId !== 'string') {
@@ -1653,25 +1703,25 @@ router.post('/v3/node-library/sync-catalog', async (req: Request, res: Response)
     // Get endpoint info for debug response
     const { discoverNodeCatalogEndpoint } = await import('../v3/n8nClient');
     const endpointResult = await discoverNodeCatalogEndpoint(connectionId);
-    
+
     const result = await syncNodeTypeCatalog(connectionId, { refresh });
-    
+
     // Count nodes with non-null config_schema (node_library_nodes doesn't have connection_id)
     const { data: nodesWithSchema } = await supabaseAdmin
       .from('node_library_nodes')
       .select('node_type')
       .not('config_schema', 'is', null);
-    
+
     const withSchemaCount = nodesWithSchema?.length || 0;
 
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/64a46d96-58fd-4c47-936c-eca813d7ba71',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'routes/v3.ts:1092',message:'sync-catalog result',data:{synced:result.synced,errors:result.errors,hasError:!!result.error,errorMessage:result.error?.message||null,endpoint:endpointResult.data?.endpoint||null,withSchemaCount},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/64a46d96-58fd-4c47-936c-eca813d7ba71', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: 'routes/v3.ts:1092', message: 'sync-catalog result', data: { synced: result.synced, errors: result.errors, hasError: !!result.error, errorMessage: result.error?.message || null, endpoint: endpointResult.data?.endpoint || null, withSchemaCount }, timestamp: Date.now(), sessionId: 'debug-session', runId: 'run1', hypothesisId: 'A' }) }).catch(() => { });
     // #endregion
 
     if (result.error) {
       console.error('[node-library] sync-catalog failed:', result.error);
-      return res.status(500).json({ 
-        error: 'Failed to sync catalog', 
+      return res.status(500).json({
+        error: 'Failed to sync catalog',
         details: result.error.message,
         endpoint: result.endpoint || endpointResult.data?.endpoint || null,
         endpointError: result.endpointError || (endpointResult.error ? { status: endpointResult.error.status, message: endpointResult.error.message } : null),
@@ -1744,12 +1794,12 @@ function normalizeCanonicalNode(raw: any): {
 
   // Normalize configSchema
   const configSchema = raw.config_schema ?? raw.configSchema ?? raw.schema ?? null;
-  
+
   // Validate: skip entries missing configSchema
   if (!configSchema || typeof configSchema !== 'object') {
     return { rejected: true, reason: 'missing or invalid configSchema' };
   }
-  
+
   // Validate: configSchema.properties MUST be an array
   const properties = configSchema.properties;
   if (!Array.isArray(properties)) {
@@ -1797,7 +1847,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
   try {
     // Normalize input: accept POST body (array or object map) or load from file
     let entries: any[] = [];
-    
+
     if (req.body && typeof req.body === 'object') {
       if (Array.isArray(req.body)) {
         // POST body is already an array
@@ -1814,7 +1864,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
         entries = Object.values(req.body);
       }
     }
-    
+
     // Fallback: load from file if no entries found
     if (entries.length === 0) {
       const { loadCanonicalCatalog } = await import('../catalog/loader');
@@ -1899,7 +1949,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
 
       // Use typeVersion from normalized entry (guaranteed to be a number), or inferred
       const finalTypeVersion = validNormalized.typeVersion !== null && validNormalized.typeVersion !== undefined
-        ? validNormalized.typeVersion 
+        ? validNormalized.typeVersion
         : (inferredTypeVersion !== null && !isNaN(inferredTypeVersion) ? inferredTypeVersion : null);
 
       // Final check: typeVersion must be a valid number
@@ -2063,7 +2113,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
       try {
         const { error: chunkError } = await supabaseAdmin
           .from('node_library_canonical_schemas')
-          .upsert(chunk, { 
+          .upsert(chunk, {
             onConflict: 'node_type,type_version,package_version',
           });
 
@@ -2073,11 +2123,11 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
           if (!firstError) {
             firstError = chunkError.message || String(chunkError);
           }
-          
+
           if (debugEnabled) {
             console.error(`[import-canonical] Chunk ${chunkNum} failed:`, chunkError);
             console.error(`[import-canonical] This may indicate duplicate conflict targets in chunk. Checking...`);
-            
+
             // Debug: check for duplicates in chunk
             const chunkKeys = chunk.map(r => `${r.node_type}|${r.type_version}|${r.package_version ?? ''}`);
             const keyCounts = new Map<string, number>();
@@ -2099,7 +2149,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
             try {
               const { error: rowError } = await supabaseAdmin
                 .from('node_library_canonical_schemas')
-                .upsert([row], { 
+                .upsert([row], {
                   onConflict: 'node_type,type_version,package_version',
                 });
 
@@ -2127,7 +2177,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
         if (!firstError) {
           firstError = chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
         }
-        
+
         if (debugEnabled) {
           console.error(`[import-canonical] Chunk ${chunkNum} exception:`, chunkErr);
         }
@@ -2137,7 +2187,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
           try {
             const { error: rowError } = await supabaseAdmin
               .from('node_library_canonical_schemas')
-              .upsert([row], { 
+              .upsert([row], {
                 onConflict: 'node_type,type_version,package_version',
               });
 
@@ -2181,7 +2231,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
         httpRequestEntriesSeen: httpRequestEntryCount,
         httpRequestInserted,
         httpRequestRejected: rejectedEntries.filter(e => e.nodeType?.includes('httpRequest')).length,
-        httpRequestDedupedDropped: realDeduped.unique.filter(r => r.node_type === 'n8n-nodes-base.httpRequest').length === 0 
+        httpRequestDedupedDropped: realDeduped.unique.filter(r => r.node_type === 'n8n-nodes-base.httpRequest').length === 0
           ? realVersionRows.filter(r => r.node_type === 'n8n-nodes-base.httpRequest').length - realDeduped.unique.filter(r => r.node_type === 'n8n-nodes-base.httpRequest').length
           : 0,
         httpRequestRowsInDb: httpRequestRows?.map(r => ({
@@ -2196,7 +2246,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
         `Debug: ${JSON.stringify(debugSummary)}`;
 
       console.error(`[import-canonical] ${errorMsg}`);
-      
+
       return res.status(500).json({
         ok: false,
         error: 'Regression check failed',
@@ -2251,7 +2301,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
     if (debugEnabled) {
       console.error('[node-library] import-canonical error:', e);
     }
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Internal server error',
       duration_ms: Date.now() - startTime,
     });
@@ -2266,7 +2316,7 @@ router.post('/v3/node-library/import-canonical', async (req: Request, res: Respo
 router.post('/v3/node-library/admin/backfill-canonical-schemas', async (req: Request, res: Response) => {
   try {
     const debugEnabled = process.env.NODE_LIBRARY_DEBUG === '1';
-    
+
     // Guard: require both env flag and secret header
     const enableBackfill = process.env.ENABLE_NODE_LIBRARY_BACKFILL === '1';
     const adminSecret = req.headers['x-admin-secret'] as string;
@@ -2420,7 +2470,7 @@ router.get('/v3/node-library/debug-node', async (req: Request, res: Response) =>
     // Determine which source is used
     let activeSource = 'none';
     let reason = '';
-    
+
     if (override?.config_schema) {
       activeSource = 'override';
       reason = 'Instance-specific override exists';
@@ -2483,7 +2533,7 @@ router.get('/v3/node-library/resolve-schema', async (req: Request, res: Response
 
     // nodeType is always required
     if (typeof nodeType !== 'string') {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Missing required query parameters',
         details: 'nodeType is required',
       });
@@ -2498,7 +2548,7 @@ router.get('/v3/node-library/resolve-schema', async (req: Request, res: Response
           details: 'connectionId must be a string',
         });
       }
-      
+
       // Validate connection exists and user has access
       const userId = await resolveUserIdForConnection(req, connectionId);
       if (!userId) {
@@ -2910,7 +2960,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
   try {
     const { workflowUuid } = req.params;
     const { connectionId } = req.body;
-    
+
     // Debug mode: if keepFailed=1, don't delete workflow on failure (for inspection)
     const keepFailed = req.query.keepFailed === '1';
     if (keepFailed) {
@@ -2976,7 +3026,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
     // If exists, activate and verify (self-healing)
     if (existingTest) {
       console.log(`[sandbox/ensure] Existing test workflow found: ${existingTest.test_n8n_workflow_id}`);
-      
+
       // Get base URL for webhook verification
       const baseUrlResult = await getConnectionBaseUrl(connectionId);
       if (baseUrlResult.error) {
@@ -2987,7 +3037,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
       }
       const baseUrl = baseUrlResult.data!;
       const webhookUrl = buildWebhookUrl(baseUrl, existingTest.test_webhook_path_secret);
-      
+
       // Always activate the workflow
       console.log(`[sandbox/ensure] Activating existing test workflow: ${existingTest.test_n8n_workflow_id}`);
       const activateResult = await setWorkflowActive(connectionId, existingTest.test_n8n_workflow_id, true);
@@ -2997,12 +3047,12 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
       } else {
         const { endpointUsed, verified } = activateResult.data!;
         console.log(`[sandbox/ensure] Activated via ${endpointUsed}, verified=${verified}`);
-        
+
         if (!verified) {
           console.warn('[sandbox/ensure] Activation call succeeded but verification failed');
         }
       }
-      
+
       // Verify webhook is registered by calling it with test payload
       console.log(`[sandbox/ensure] Verifying webhook registration: ${webhookUrl}`);
       const verifyResult = await invokeWebhook(
@@ -3011,7 +3061,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         { test: true, timestamp: Date.now() },
         { 'X-VN-Test-Secret': existingTest.webhook_auth_secret }
       );
-      
+
       // If webhook verification succeeds (any non-404 status), return existing workflow
       if (verifyResult.status !== 404) {
         console.log(`[sandbox/ensure] Webhook verified successfully (status: ${verifyResult.status})`);
@@ -3027,25 +3077,25 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
           },
         });
       }
-      
+
       // Webhook verification failed (404) - delete and recreate
       console.warn('[sandbox/ensure] Webhook verification failed (404), deleting old workflow and recreating...');
-      
+
       // Delete old workflow in n8n
       await deleteWorkflow(connectionId, existingTest.test_n8n_workflow_id).catch((e) => {
         console.error('[sandbox/ensure] Failed to delete old test workflow:', e);
       });
-      
+
       // Delete DB record
       const { error: deleteError } = await supabaseAdmin
         .from('vn_test_workflows')
         .delete()
         .eq('id', existingTest.id);
-      
+
       if (deleteError) {
         console.error('[sandbox/ensure] Failed to delete DB record:', deleteError);
       }
-      
+
       console.log('[sandbox/ensure] Old workflow deleted, proceeding to create new one...');
       // Fall through to create new workflow
     }
@@ -3084,13 +3134,13 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
     }
     const createdWorkflow = createResult.data!;
     console.log(`[sandbox/ensure] Workflow created in n8n with ID: ${createdWorkflow.id}`);
-    
+
     // ========== DIAGNOSTIC: Fetch workflow back from n8n to verify what was actually created ==========
     const diagFetch = await getWorkflow(connectionId, createdWorkflow.id);
     if (diagFetch.data) {
       const wf = diagFetch.data;
       const webhookNodes = wf.nodes.filter((n: { type: string }) => n.type === 'n8n-nodes-base.webhook');
-      
+
       console.log('[sandbox/ensure] === DIAGNOSTIC: Workflow fetched from n8n ===');
       console.log(JSON.stringify({
         workflow_id: wf.id,
@@ -3129,7 +3179,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         message: activateResult.error.message,
         details: activateResult.error.details,
       });
-      
+
       // Cleanup: delete the inactive workflow since it won't be usable (unless keepFailed)
       if (!keepFailed) {
         await deleteWorkflow(connectionId, createdWorkflow.id).catch((e) => {
@@ -3148,13 +3198,13 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         keep_failed: keepFailed,
       });
     }
-    
+
     const { endpointUsed, verified } = activateResult.data!;
     console.log(`[sandbox/ensure] Test workflow activated via ${endpointUsed}, verified=${verified}`);
-    
+
     if (!verified) {
       console.error('[sandbox/ensure] Activation call succeeded but verification failed');
-      
+
       // Cleanup: delete the workflow that won't activate properly (unless keepFailed)
       if (!keepFailed) {
         await deleteWorkflow(connectionId, createdWorkflow.id).catch((e) => {
@@ -3163,7 +3213,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
       } else {
         console.log(`[sandbox/ensure] keepFailed=1: NOT deleting workflow ${createdWorkflow.id} - inspect in n8n UI`);
       }
-      
+
       return res.status(500).json({
         ok: false,
         error: 'Workflow activation reported success but verification failed - workflow may not support activation',
@@ -3204,17 +3254,17 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
     const baseUrlResult = await getConnectionBaseUrl(connectionId);
     const baseUrl = baseUrlResult.data || '';
     const webhookUrl = buildWebhookUrl(baseUrl, insertedRow.test_webhook_path_secret);
-    
+
     // Retry webhook verification with increasing delays (n8n Cloud can be slow)
     const verifyDelays = [1000, 2000, 3000]; // Total: up to 6 seconds of waiting
     let verifyResult: { status: number; data: unknown; latencyMs: number; error?: string } = { status: 0, data: {}, latencyMs: 0 };
     let webhookRegistered = false;
-    
+
     for (let attempt = 0; attempt < verifyDelays.length; attempt++) {
       const delayMs = verifyDelays[attempt];
       console.log(`[sandbox/ensure] Webhook verification attempt ${attempt + 1}/${verifyDelays.length}, waiting ${delayMs}ms...`);
       await new Promise(resolve => setTimeout(resolve, delayMs));
-      
+
       console.log(`[sandbox/ensure] Verifying webhook registration: ${webhookUrl}`);
       verifyResult = await invokeWebhook(
         baseUrl,
@@ -3222,22 +3272,22 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         { test: true, timestamp: Date.now() },
         { 'X-VN-Test-Secret': insertedRow.webhook_auth_secret }
       );
-      
+
       if (verifyResult.status !== 404) {
         console.log(`[sandbox/ensure] Webhook verified successfully on attempt ${attempt + 1} (status: ${verifyResult.status})`);
         webhookRegistered = true;
         break;
       }
-      
+
       console.log(`[sandbox/ensure] Attempt ${attempt + 1} returned 404, will retry...`);
     }
-    
+
     if (!webhookRegistered) {
       console.error('[sandbox/ensure] CRITICAL: Webhook verification failed with 404 after all retries!');
       console.error('[sandbox/ensure] Webhook URL:', webhookUrl);
       console.error('[sandbox/ensure] Workflow ID:', createdWorkflow.id);
       console.error('[sandbox/ensure] Response:', verifyResult.data);
-      
+
       // Fetch final workflow state for diagnostics
       let finalDiagnostics: Record<string, unknown> = {};
       const finalFetch = await getWorkflow(connectionId, createdWorkflow.id);
@@ -3255,7 +3305,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         };
         console.error('[sandbox/ensure] FINAL DIAGNOSTIC:', JSON.stringify(finalDiagnostics, null, 2));
       }
-      
+
       // Clean up the broken workflow (unless keepFailed)
       if (!keepFailed) {
         console.log('[sandbox/ensure] Cleaning up broken workflow...');
@@ -3273,7 +3323,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         console.log(`[sandbox/ensure] keepFailed=1: NOT deleting workflow ${createdWorkflow.id} - inspect in n8n UI`);
         console.log(`[sandbox/ensure] n8n UI URL: ${baseUrl}/workflow/${createdWorkflow.id}`);
       }
-      
+
       return res.status(500).json({
         ok: false,
         error: 'Webhook registration failed: webhook returns 404 even after activation and retries',
@@ -3289,7 +3339,7 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
         inspect_url: keepFailed ? `${baseUrl}/workflow/${createdWorkflow.id}` : null,
       });
     }
-    
+
     console.log(`[sandbox/ensure] Webhook verified successfully (status: ${verifyResult.status})`);
 
     // 11. Return success with activation diagnostics
@@ -3312,6 +3362,139 @@ router.post('/v3/workflows/:workflowUuid/sandbox/ensure', async (req: Request, r
       ok: false,
       error: 'Failed to ensure sandbox workflow',
     });
+  }
+});
+
+/**
+ * POST /api/v3/workflows/:workflowUuid/sandbox/status
+ * Health check for VN TEST sandbox: checks workflow exists, is active, webhook reachable.
+ * Safe self-heal: tries activate + retry on 404, but does NOT auto-delete.
+ */
+router.post('/v3/workflows/:workflowUuid/sandbox/status', async (req: Request, res: Response) => {
+  try {
+    const { workflowUuid } = req.params;
+    const { connectionId } = req.body;
+
+    if (!connectionId || typeof connectionId !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Missing connectionId' });
+    }
+    if (!workflowUuid || typeof workflowUuid !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Missing workflowUuid' });
+    }
+
+    const userId = await resolveUserIdForConnection(req, connectionId);
+    if (!userId) {
+      return res.status(403).json({ ok: false, error: 'Unauthorized or connection not found' });
+    }
+
+    // 1. Lookup VN TEST workflow from DB
+    const { data: testRow, error: lookupErr } = await supabaseAdmin
+      .from('vn_test_workflows')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('connection_id', connectionId)
+      .eq('prod_workflow_uuid', workflowUuid)
+      .maybeSingle();
+
+    if (lookupErr) {
+      console.error('[sandbox/status] DB lookup error:', lookupErr);
+      return res.status(500).json({ ok: false, error: 'Database error' });
+    }
+
+    if (!testRow) {
+      return res.json({
+        ok: true,
+        active: false,
+        webhook_reachable: false,
+        needs_recreate: true,
+        test_workflow_id: null,
+      });
+    }
+
+    const testWorkflowId = testRow.test_n8n_workflow_id;
+
+    // 2. Check if n8n workflow exists and is active
+    const wfResult = await getWorkflow(connectionId, testWorkflowId);
+    if (wfResult.error) {
+      console.warn(`[sandbox/status] Workflow ${testWorkflowId} not found in n8n:`, wfResult.error.message);
+      return res.json({
+        ok: true,
+        active: false,
+        webhook_reachable: false,
+        needs_recreate: true,
+        test_workflow_id: testWorkflowId,
+      });
+    }
+
+    const isActive = wfResult.data!.active === true;
+
+    // 3. Ping webhook URL
+    const baseUrlResult = await getConnectionBaseUrl(connectionId);
+    if (baseUrlResult.error) {
+      return res.status(500).json({ ok: false, error: 'Failed to get connection URL' });
+    }
+    const baseUrl = baseUrlResult.data!;
+
+    let pingResult = await invokeWebhook(
+      baseUrl,
+      testRow.test_webhook_path_secret,
+      { _vn_status_check: true, timestamp: Date.now() },
+      { 'X-VN-Test-Secret': testRow.webhook_auth_secret }
+    );
+
+    let webhookReachable = pingResult.status !== 404 && pingResult.status !== 410 && pingResult.status !== 0;
+    let needsRecreate = false;
+
+    // 4. Self-heal on 404/410/unreachable
+    if (!webhookReachable) {
+      // Don't attempt repair on auth or rate-limit issues
+      if (pingResult.status === 401 || pingResult.status === 403 || pingResult.status === 429) {
+        console.warn(`[sandbox/status] Webhook returned ${pingResult.status}, skipping repair`);
+      } else {
+        console.log(`[sandbox/status] Webhook unreachable (${pingResult.status}), attempting activation...`);
+        const activateResult = await setWorkflowActive(connectionId, testWorkflowId, true);
+        if (activateResult.error) {
+          console.error('[sandbox/status] Activation failed:', activateResult.error.message);
+        } else {
+          console.log('[sandbox/status] Activated, retrying webhook...');
+          await new Promise(r => setTimeout(r, 1500));
+
+          pingResult = await invokeWebhook(
+            baseUrl,
+            testRow.test_webhook_path_secret,
+            { _vn_status_check: true, timestamp: Date.now() },
+            { 'X-VN-Test-Secret': testRow.webhook_auth_secret }
+          );
+
+          webhookReachable = pingResult.status !== 404 && pingResult.status !== 410 && pingResult.status !== 0;
+        }
+
+        if (!webhookReachable) {
+          needsRecreate = true;
+          console.warn('[sandbox/status] Webhook still unreachable after repair, needs_recreate=true');
+        }
+      }
+    }
+
+    // Re-check active state after potential activation
+    let activeNow = isActive;
+    if (!isActive && !needsRecreate) {
+      const recheck = await getWorkflow(connectionId, testWorkflowId);
+      if (recheck.data) activeNow = recheck.data.active === true;
+    }
+
+    console.log(`[sandbox/status] Result: active=${activeNow}, reachable=${webhookReachable}, recreate=${needsRecreate}`);
+
+    return res.json({
+      ok: true,
+      active: activeNow,
+      webhook_reachable: webhookReachable,
+      needs_recreate: needsRecreate,
+      test_workflow_id: testWorkflowId,
+    });
+  } catch (e) {
+    console.error('[sandbox/status] error:', e);
+    res.status(500).json({ ok: false, error: 'Failed to check sandbox status' });
   }
 });
 
@@ -3525,31 +3708,25 @@ router.post('/v3/workflows/:workflowUuid/sandbox/run', async (req: Request, res:
       webhookHeaders
     );
 
-    // RETRY LOGIC: If 404 and message mentions workflow activation, try activating and retry once
-    if (result.status === 404 && result.data && typeof result.data === 'object') {
-      const responseData = result.data as Record<string, unknown>;
-      const message = String(responseData.message || '').toLowerCase();
-      const hint = String(responseData.hint || '').toLowerCase();
-      
-      if (message.includes('workflow') && (message.includes('active') || hint.includes('active'))) {
-        console.log(`[sandbox/run] Webhook returned 404 (inactive workflow), attempting to activate: ${testWorkflow.test_n8n_workflow_id}`);
-        
-        const activateResult = await setWorkflowActive(connectionId, testWorkflow.test_n8n_workflow_id, true);
-        if (activateResult.error) {
-          console.error('[sandbox/run] Failed to activate workflow:', activateResult.error);
-        } else {
-          console.log('[sandbox/run] Workflow activated, retrying webhook call...');
-          
-          // Retry webhook invocation
-          result = await invokeWebhook(
-            baseUrl,
-            testWorkflow.test_webhook_path_secret,
-            fixture.payload || {},
-            webhookHeaders
-          );
-          
-          console.log(`[sandbox/run] Retry result: status=${result.status}`);
-        }
+    // RETRY LOGIC: On ANY 404 from webhook, try activating workflow and retry once
+    if (result.status === 404) {
+      console.log(`[sandbox/run] Webhook returned 404, attempting to activate: ${testWorkflow.test_n8n_workflow_id}`);
+
+      const activateResult = await setWorkflowActive(connectionId, testWorkflow.test_n8n_workflow_id, true);
+      if (activateResult.error) {
+        console.error('[sandbox/run] Failed to activate workflow:', activateResult.error);
+      } else {
+        console.log('[sandbox/run] Workflow activated, waiting 1s then retrying webhook...');
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Retry webhook invocation
+        result = await invokeWebhook(
+          baseUrl,
+          testWorkflow.test_webhook_path_secret,
+          fixture.payload || {},
+          webhookHeaders
+        );
+        console.log(`[sandbox/run] Retry result: status=${result.status}`);
       }
     }
 
@@ -3599,9 +3776,19 @@ router.post('/v3/workflows/:workflowUuid/sandbox/run', async (req: Request, res:
 
 /**
  * POST /api/v3/assist/ask
- * Phase 2: Ask mode - Get AI assistance for workflow questions
+ * Phase 2A: Ask mode - Deterministic AI assistance for workflow questions
+ * 
+ * Guarantees:
+ * - temperature=0 for deterministic outputs
+ * - Stable issue ranking (severity -> category -> node)
+ * - Structured response with citations and evidence
+ * - Timing instrumentation for debugging
  */
 router.post('/v3/assist/ask', async (req: Request, res: Response) => {
+  // Phase 2A: Start timing instrumentation
+  const startTotal = Date.now();
+  const timings: AskTimings = createEmptyTimings();
+
   try {
     const { connectionId, workflowUuid, sessionId, message } = req.body;
 
@@ -3662,12 +3849,16 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
     const sourceTable = resolveResult.sourceTable || 'workflows';
 
     // 4. Fetch workflow JSON from n8n
+    const fetchStart = Date.now();
     const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
+    timings.fetch_workflow = Date.now() - fetchStart;
+
     if (workflowResult.error) {
       return res.status(500).json({
         ok: false,
         error: 'Failed to fetch workflow from n8n',
         details: workflowResult.error.message,
+        debug: createEmptyDebug(workflowUuid),
       });
     }
 
@@ -3690,7 +3881,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
     // 4c. Fetch latest execution error (if any) - with improved parsing
     let latestExecutionError: LatestExecutionError | null = null;
     let executionErrorDebug: Record<string, unknown> | null = null;
-    
+
     // If workflow is healthy, skip error analysis
     if (executionHealth.isHealthy) {
       console.log(`[assist/ask] Workflow is healthy, skipping error analysis`);
@@ -3703,21 +3894,21 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
     } else {
       // Workflow has error or unknown state, analyze it
       console.log(`[assist/ask] Workflow not healthy, analyzing latest error execution`);
-      
+
       try {
         const executionsResult = await listRecentExecutions(connectionId, n8nWorkflowId, 5, {
           includeData: true,
         });
-        
+
         if (!executionsResult.error && executionsResult.data && executionsResult.data.length > 0) {
           // Find first error execution
           const failedExecution = executionsResult.data.find(exec => exec.status === 'error');
-          
+
           if (failedExecution) {
             let failedNode = 'Unknown';
             let errorMessage = 'Unknown error';
             let rawErrorSnippet: Record<string, unknown> = {};
-            
+
             // Strategy 1: Extract from resultData.error (top-level error)
             if (failedExecution.data?.resultData?.error) {
               const topError = failedExecution.data.resultData.error;
@@ -3728,7 +3919,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
                 stack: topError.stack?.slice(0, 200),
               };
             }
-            
+
             // Strategy 2: Find failed node from runData
             if (failedExecution.data?.resultData?.runData) {
               for (const [nodeName, nodeData] of Object.entries(failedExecution.data.resultData.runData)) {
@@ -3747,14 +3938,14 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
                 }
               }
             }
-            
+
             // Strategy 3: If still unknown, fetch full execution details
             if (failedNode === 'Unknown' && failedExecution.id) {
               try {
                 const fullExecResult = await getExecution(connectionId, failedExecution.id);
                 if (!fullExecResult.error && fullExecResult.data) {
                   const fullExec = fullExecResult.data;
-                  
+
                   // Try to extract from full execution data
                   if (fullExec.data?.resultData?.runData) {
                     for (const [nodeName, nodeData] of Object.entries(fullExec.data.resultData.runData)) {
@@ -3779,21 +3970,21 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
                 console.warn('[assist/ask] Could not fetch full execution details:', fullExecError);
               }
             }
-            
+
             latestExecutionError = {
               executionId: failedExecution.id || '',
               failedNode,
               errorMessage,
               timestamp: failedExecution.stoppedAt || '',
             };
-            
+
             executionErrorDebug = {
               executionId: failedExecution.id,
               status: failedExecution.status,
               failedNode,
               rawErrorSnippet,
             };
-            
+
             console.log(`[assist/ask] Found latest execution error at node: ${latestExecutionError.failedNode}`);
           }
         }
@@ -3805,7 +3996,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
 
     // 5. Build context pack (includes evaluation)
     console.log(`[assist/ask] Building context for workflow: ${workflow.name}`);
-    
+
     // If workflow is healthy, prepare a health-focused context
     let contextPack: ContextPack;
     if (executionHealth.isHealthy && executionHealth.latestSuccess) {
@@ -3825,7 +4016,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
           name: workflow.name || '',
           active: workflow.active || false,
           nodeCount: (workflow.nodes || []).length,
-          connectionCount: (workflow.connections || []).length,
+          connectionCount: Object.keys(workflow.connections || {}).length,
         },
         nodes: [],
         missingCredentials: [],
@@ -3870,7 +4061,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
       // Healthy workflow: no LLM needed, use simple response
       // This happens when: latest execution succeeded AND (no error OR latest success is newer than latest error)
       console.log(`[assist/ask] Workflow is healthy, using simple response (no LLM)`);
-      
+
       const previousErrorId = executionHealth.latestError ? ` (previously failed at execution ${executionHealth.latestError.id})` : '';
       assistResponse = {
         answer: `Looks fixed. Latest execution #${executionHealth.latestAny?.id || 'unknown'} succeeded.${previousErrorId}`,
@@ -3894,7 +4085,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
 
         // Estimate tokens
         const totalInputTokens = estimateTokens(systemPrompt) + estimateTokens(userPrompt);
-        
+
         if (totalInputTokens > 100000) {
           return res.status(400).json({
             ok: false,
@@ -3903,22 +4094,24 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
           });
         }
 
-        console.log(`[assist/ask] LLM attempt ${llmAttempts}/${MAX_ATTEMPTS}, strict=${isRetry}`);
+        console.log(`[assist/ask] LLM attempt ${llmAttempts}/${MAX_ATTEMPTS}`);
 
-        // Call LLM with JSON mode
+        // Call LLM with JSON mode - Phase 2A: wrapped in timing
+        const llmStart = Date.now();
         const llmResult = await callLLM({
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
           ],
-          temperature: isRetry ? 0.3 : 0.7, // Lower temperature on retry
-          maxTokens: 2000,
+          temperature: ASK_BUDGETS.temperature, // Phase 2A: Always 0 for determinism
+          maxTokens: ASK_BUDGETS.max_tokens,
           jsonMode: true, // Force JSON response
         });
+        timings.llm += Date.now() - llmStart;
 
         if (!llmResult.ok) {
           console.error('[assist/ask] LLM error:', llmResult.error);
-          
+
           // On LLM failure, use deterministic fallback
           console.log('[assist/ask] Using deterministic fallback due to LLM error');
           assistResponseOrNull = buildDeterministicResponse(safeContext, message);
@@ -3929,7 +4122,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
         const parsedResponse = parseAssistResponse(llmResult.data.answer);
         if (!parsedResponse) {
           console.warn('[assist/ask] Failed to parse LLM JSON response, attempt:', llmAttempts);
-          
+
           if (llmAttempts >= MAX_ATTEMPTS) {
             console.log('[assist/ask] Max attempts reached, using deterministic fallback');
             assistResponseOrNull = buildDeterministicResponse(safeContext, message);
@@ -3939,14 +4132,14 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
 
         // Validate response
         validationResult = validateAssistResponse(parsedResponse, safeContext);
-        
+
         if (validationResult.valid) {
           // Success!
           assistResponseOrNull = parsedResponse;
           console.log('[assist/ask] Response validated successfully');
         } else {
           console.warn(`[assist/ask] Validation failed (attempt ${llmAttempts}):`, validationResult.errors);
-          
+
           if (llmAttempts >= MAX_ATTEMPTS) {
             // Max attempts - use deterministic fallback
             console.log('[assist/ask] Max attempts reached, using deterministic fallback');
@@ -3975,6 +4168,10 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
       warnings: [],
     };
 
+    // Phase 2A: Finalize timings
+    timings.total = Date.now() - startTotal;
+    timings.analyze = timings.total - timings.fetch_workflow - timings.llm; // Remainder is analyze time
+
     const responsePayload = {
       ok: true,
       answer: assistResponse.answer,
@@ -3982,14 +4179,18 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
       issues: assistResponse.issues,
       citations: assistResponse.citations,
       debug: {
-        // Workflow analysis metadata
-        analyzed_n8n_workflow_id: n8nWorkflowId,
-        analyzed_source: sourceTable === 'vn_test_workflows' ? 'vn_test' : 'prod',
+        // Phase 2A: Core contract fields
+        analyzed_source: (sourceTable === 'vn_test_workflows' ? 'test' : 'prod') as 'prod' | 'test',
+        workflow_uuid: workflowUuid,
+        n8n_workflow_id: n8nWorkflowId,
         workflow_updated_at_from_n8n: syncInfo.workflowUpdatedAt,
-        cache_updated_at: syncInfo.cacheUpdatedAt,
-        workflow_synced: syncInfo.synced,
-        workflow_unchanged: syncInfo.unchanged,
-        
+
+        // Phase 2A: Budgets (constant for transparency)
+        budgets: { ...ASK_BUDGETS },
+
+        // Phase 2A: Timing breakdown
+        timings_ms: timings,
+
         // Context summary
         contextPackSummary: {
           workflowName: safeContext.workflow.name,
@@ -3999,7 +4200,7 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
           evaluationIssues: safeContext.evaluationIssues.length,
           latestExecutionError: safeContext.latestExecutionError ? 'YES' : 'NO',
         },
-        
+
         // Execution selection & health analysis
         executionSelection: {
           pickedExecutionId: executionHealth.pickedExecutionId,
@@ -4016,13 +4217,13 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
           latestSuccessFinishedAt: executionHealth.latestSuccess?.finishedAt || null,
           recentExecutions: executionHealth.recentExecutions,
         },
-        
+
         // Execution error details
         executionErrorDebug: executionErrorDebug || null,
-        
+
         // Validation (always an object, never null)
         validation: validationSafe,
-        
+
         // LLM metadata
         llmAttempts,
         usedDeterministicFallback: llmAttempts === 0 || (validationResult && !validationResult.valid),
@@ -4059,6 +4260,944 @@ router.post('/v3/assist/ask', async (req: Request, res: Response) => {
       error: 'Internal error processing Ask request',
       details: e instanceof Error ? e.message : String(e),
     });
+  }
+});
+
+/**
+ * POST /api/v3/assist/plan
+ * Phase 2B: Generate structured fix plan with DB persistence
+ * 
+ * Input:
+ * - connectionId: string (required)
+ * - workflowUuid: string (required)
+ * - analyzed_source: 'prod' | 'test' (optional, default 'prod')
+ * - userGoal: string (optional)
+ * 
+ * Returns: PlanContractResponse
+ */
+router.post('/v3/assist/plan', async (req: Request, res: Response) => {
+  const timings = createEmptyPlanTimings();
+  const startTotal = Date.now();
+
+  try {
+    // 1. Validate input - accept both workflowUuid and workflowId
+    const { connectionId, analyzed_source, userGoal } = req.body;
+    const workflowId = req.body.workflowUuid ?? req.body.workflowId;
+
+    if (!connectionId || typeof connectionId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'connectionId is required',
+        plan: null,
+        debug: createEmptyPlanDebug(workflowId || ''),
+      });
+    }
+
+    if (!workflowId || typeof workflowId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'workflowUuid is required',
+        plan: null,
+        debug: createEmptyPlanDebug(''),
+      });
+    }
+
+    const analyzedSource = analyzed_source === 'test' ? 'test' : 'prod';
+    const debug: PlanDebug = createEmptyPlanDebug(workflowId);
+    debug.analyzed_source = analyzedSource;
+
+    console.log(`[assist/plan] Starting for workflow ${workflowId}, source=${analyzedSource}`);
+
+    // 2. Resolve user from connection
+    const userId = await getConnectionUserId(connectionId);
+    if (!userId) {
+      console.error('[assist/plan] Failed to get userId for connection:', connectionId);
+      return res.status(400).json({
+        ok: false,
+        error: 'Invalid connectionId',
+        plan: null,
+        debug,
+      });
+    }
+
+    // 3. Resolve workflow ID using the same bridge as other endpoints
+    const startFetch = Date.now();
+
+    const resolveResult = await resolveN8nWorkflowId({
+      workflowId,
+      connectionId,
+      userId,
+    });
+
+    if (!resolveResult.ok) {
+      console.error('[assist/plan] Workflow resolution failed:', resolveResult.error);
+      return res.status(404).json({
+        ok: false,
+        error: 'Workflow not found',
+        plan: null,
+        debug: {
+          ...debug,
+          lookup: {
+            connectionId,
+            workflowId,
+            resolveError: resolveResult.error,
+            resolveCode: resolveResult.code,
+            hint: 'Run /api/n8n/sync then retry',
+          },
+        },
+      });
+    }
+
+    const n8nWorkflowId = resolveResult.n8nWorkflowId;
+    debug.n8n_workflow_id = n8nWorkflowId;
+    console.log(`[assist/plan] Resolved n8nWorkflowId: ${n8nWorkflowId}`);
+
+    // 4. Fetch workflow JSON from n8n
+    const workflowResult = await getWorkflow(connectionId, n8nWorkflowId);
+    if (workflowResult.error || !workflowResult.data) {
+      console.error('[assist/plan] Failed to fetch workflow:', workflowResult.error);
+      return res.status(500).json({
+        ok: false,
+        error: 'Failed to fetch workflow from n8n',
+        plan: null,
+        debug,
+      });
+    }
+
+    const workflow = workflowResult.data;
+    timings.fetch_workflow = Date.now() - startFetch;
+
+    // 5. Build context pack
+    const startAnalyze = Date.now();
+    const contextPack = await buildContextPack(workflow, {
+      connectionId,
+      maxNodes: 50,
+      maxSchemaSize: 2000,
+    });
+    const sanitizedContext = sanitizeContextPack(contextPack);
+    timings.analyze = Date.now() - startAnalyze;
+
+    // 6. Build LLM messages
+    const systemPrompt = buildPlanSystemPrompt(sanitizedContext, userGoal);
+    const userContext = buildPlanUserContext(sanitizedContext);
+
+    const estimatedTokens = estimateTokens(systemPrompt + userContext);
+    console.log(`[assist/plan] Estimated tokens: ${estimatedTokens}`);
+
+    // 7. Call LLM with deterministic settings
+    const startLLM = Date.now();
+    const llmResult = await callLLM({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContext },
+      ],
+      temperature: PLAN_BUDGETS.temperature, // Always 0
+      maxTokens: PLAN_BUDGETS.max_tokens,
+      jsonMode: true,
+    });
+    timings.llm = Date.now() - startLLM;
+
+    if (!llmResult.ok) {
+      console.error('[assist/plan] LLM error:', llmResult.error);
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'LLM call failed',
+        plan: null,
+        debug,
+      });
+    }
+
+    // 8. Parse and validate plan
+    const plan = parsePlanResponse(llmResult.data.answer);
+    if (!plan) {
+      console.error('[assist/plan] Plan validation failed');
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'Invalid plan format from LLM',
+        plan: null,
+        debug,
+      });
+    }
+
+    // 9. Atomic DB persistence via RPC (transactional)
+    const startDb = Date.now();
+    const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('create_completion_plan', {
+      p_workflow_id: workflowId,
+      p_connection_id: connectionId,
+      p_plan_json: plan,
+      p_analyzed_source: analyzedSource,
+      p_created_by: 'assist/plan',
+    });
+
+    if (rpcError) {
+      console.error('[assist/plan] RPC create_completion_plan failed:', rpcError.message);
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'Failed to persist plan',
+        plan: null,
+        debug,
+      });
+    }
+
+    // Validate RPC result shape
+    const rpcData = Array.isArray(rpcResult) ? rpcResult[0] : rpcResult;
+    if (!rpcData?.plan_id || !rpcData?.plan_created_at) {
+      console.error('[assist/plan] RPC returned invalid shape:', JSON.stringify(rpcData).slice(0, 200));
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'Plan persistence returned invalid data',
+        plan: null,
+        debug,
+      });
+    }
+
+    const dbTime = Date.now() - startDb;
+    console.log(`[assist/plan] Plan persisted via RPC in ${dbTime}ms, id: ${rpcData.plan_id}`);
+
+    // 10. Server overrides identity fields (security)
+    plan.id = rpcData.plan_id;
+    plan.created_at = rpcData.plan_created_at;
+
+    // 11. Sort for determinism
+    const sortedPlan = sortPlanForDeterminism(plan);
+
+    // 12. Finalize timings
+    timings.total = Date.now() - startTotal;
+    debug.timings_ms = timings;
+
+    // 13. Return response
+    const response: PlanContractResponse = {
+      ok: true,
+      plan: sortedPlan,
+      debug,
+    };
+
+    console.log(`[assist/plan] Success in ${timings.total}ms, phases=${sortedPlan.phases.length}`);
+    res.json(response);
+
+  } catch (e) {
+    console.error('[assist/plan] error:', e);
+    res.status(500).json({
+      ok: false,
+      error: 'Internal error processing Plan request',
+      plan: null,
+      debug: createEmptyPlanDebug(''),
+    });
+  }
+});
+
+/**
+ * POST /api/v3/assist/apply-step
+ * Phase 2B Step 2: Apply a single plan step to VN TEST workflow
+ * 
+ * Safety:
+ * - NEVER writes to prod workflow
+ * - Only whitelisted patch operations allowed
+ * - dry_run=true (default) skips n8n update
+ */
+router.post('/v3/assist/apply-step', async (req: Request, res: Response) => {
+  const timings = createEmptyApplyStepTimings();
+  const startTotal = Date.now();
+
+  try {
+    // 1. Validate input - accept both workflowUuid and workflowId
+    const { connectionId, planId, stepId, analyzed_source } = req.body;
+    const workflowId = req.body.workflowUuid ?? req.body.workflowId;
+    const dryRun = req.body.dry_run !== false; // Default true for safety
+
+    // Parse idempotency_key: accept snake_case or camelCase, trim, treat empty as null
+    const rawKey = req.body.idempotency_key || req.body.idempotencyKey;
+    const idempotency_key = (typeof rawKey === 'string' && rawKey.trim()) ? rawKey.trim() : null;
+
+    if (!connectionId || typeof connectionId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'connectionId is required',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug: createEmptyApplyStepDebug(workflowId || '', planId || '', stepId || ''),
+      });
+    }
+
+    if (!workflowId || typeof workflowId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'workflowUuid is required',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug: createEmptyApplyStepDebug('', planId || '', stepId || ''),
+      });
+    }
+
+    if (!planId || typeof planId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'planId is required',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug: createEmptyApplyStepDebug(workflowId, '', stepId || ''),
+      });
+    }
+
+    if (!stepId || typeof stepId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'stepId is required',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug: createEmptyApplyStepDebug(workflowId, planId, ''),
+      });
+    }
+
+    const debug: ApplyStepDebug = createEmptyApplyStepDebug(workflowId, planId, stepId);
+    debug.dry_run = dryRun;
+    debug.idempotency_key = idempotency_key || null;
+    debug.idempotency_hit = false;
+
+    console.log(`[assist/apply-step] Starting: workflow=${workflowId}, plan=${planId}, step=${stepId}, dry_run=${dryRun}, idempotency=${idempotency_key}`);
+    console.log(`[assist/apply-step] Parsed idempotency_key="${idempotency_key}" (type: ${typeof idempotency_key}, raw: "${rawKey}")`);
+
+    // EARLY IDEMPOTENCY CHECK: If idempotency_key provided, check for existing application
+    if (idempotency_key) {
+      const { data: existingApp, error: lookupError } = await supabaseAdmin
+        .from('step_applications')
+        .select('*')
+        .eq('idempotency_key', idempotency_key)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (lookupError) {
+        console.error('[assist/apply-step] Idempotency lookup error:', lookupError);
+      }
+
+      if (existingApp) {
+        console.log(`[assist/apply-step] Idempotency hit: key=${idempotency_key}, existing_id=${existingApp.id}`);
+
+        // Validate metadata matches
+        if (
+          existingApp.workflow_uuid !== workflowId ||
+          existingApp.plan_id !== planId ||
+          existingApp.step_id !== stepId
+        ) {
+          console.error('[assist/apply-step] Idempotency key conflict:', {
+            key: idempotency_key,
+            existing: { workflow: existingApp.workflow_uuid, plan: existingApp.plan_id, step: existingApp.step_id },
+            requested: { workflow: workflowId, plan: planId, step: stepId },
+          });
+          return res.status(409).json({
+            ok: false,
+            error: 'Idempotency key already used with different workflow/plan/step',
+            patch: null,
+            test_workflow_id: existingApp.test_workflow_id,
+            diff_summary: null,
+            debug: {
+              ...debug,
+              idempotency_hit: true,
+              idempotency_key,
+              existing_application_id: existingApp.id,
+              dry_run: dryRun,
+            },
+          });
+        }
+
+        // Return cached result based on status
+        const isSuccess = existingApp.status === 'applied';
+        return res.json({
+          ok: isSuccess,
+          error: isSuccess ? undefined : existingApp.error || 'Previous application failed',
+          patch: existingApp.patch_json,
+          test_workflow_id: existingApp.test_workflow_id,
+          diff_summary: existingApp.diff_summary,
+          debug: {
+            ...debug,
+            idempotency_hit: true,
+            idempotency_key,
+            existing_application_id: existingApp.id,
+            cached_status: existingApp.status,
+            dry_run: dryRun,
+          },
+        });
+      }
+    }
+
+
+    // 2. Resolve user from connection
+    const userId = await getConnectionUserId(connectionId);
+    if (!userId) {
+      console.error('[assist/apply-step] Failed to get userId for connection:', connectionId);
+      return res.status(400).json({
+        ok: false,
+        error: 'Invalid connectionId',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // 3. Resolve prod n8n workflow ID
+    const startLookup = Date.now();
+    const resolveResult = await resolveN8nWorkflowId({
+      workflowId,
+      connectionId,
+      userId,
+    });
+
+    if (!resolveResult.ok) {
+      console.error('[assist/apply-step] Workflow resolution failed:', resolveResult.error);
+      return res.status(404).json({
+        ok: false,
+        error: 'Workflow not found',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    const prodN8nWorkflowId = resolveResult.n8nWorkflowId;
+    debug.prod_workflow_id_DENIED = prodN8nWorkflowId; // SAFETY: we NEVER write to this
+
+    // 4. Load plan from completion_plans
+    const { data: planRow, error: planError } = await supabaseAdmin
+      .from('completion_plans')
+      .select('id, workflow_id, plan_json, is_active')
+      .eq('id', planId)
+      .single();
+
+    if (planError || !planRow) {
+      console.error('[assist/apply-step] Plan not found:', planError);
+      return res.status(404).json({
+        ok: false,
+        error: 'Plan not found',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // Verify workflow matches
+    if (planRow.workflow_id !== workflowId) {
+      console.error('[assist/apply-step] Plan workflow mismatch:', planRow.workflow_id, workflowId);
+      return res.status(400).json({
+        ok: false,
+        error: 'Plan does not belong to this workflow',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // 5. Load step from completion_steps
+    const { data: stepRow, error: stepError } = await supabaseAdmin
+      .from('completion_steps')
+      .select('step_id, plan_id, step_json, status')
+      .eq('plan_id', planId)
+      .eq('step_id', stepId)
+      .single();
+
+    if (stepError || !stepRow) {
+      console.error('[assist/apply-step] Step not found:', stepError);
+      return res.status(404).json({
+        ok: false,
+        error: 'Step not found in plan',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // 6. Get VN TEST workflow mapping
+    const { data: testMapping, error: testError } = await supabaseAdmin
+      .from('vn_test_workflows')
+      .select('test_n8n_workflow_id')
+      .eq('user_id', userId)
+      .eq('connection_id', connectionId)
+      .eq('prod_workflow_uuid', workflowId)
+      .maybeSingle();
+
+    if (testError) {
+      console.error('[assist/apply-step] Test workflow lookup error:', testError);
+      return res.status(500).json({
+        ok: false,
+        error: 'Failed to lookup test workflow',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    if (!testMapping || !testMapping.test_n8n_workflow_id) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Test workflow not found. Call /sandbox/ensure first.',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    const testWorkflowId = testMapping.test_n8n_workflow_id;
+    debug.test_workflow_id = testWorkflowId;
+
+    // SAFETY CHECK: Ensure test workflow != prod workflow
+    if (testWorkflowId === prodN8nWorkflowId) {
+      console.error('[assist/apply-step] SAFETY VIOLATION: test_workflow_id equals prod_workflow_id!');
+      return res.status(400).json({
+        ok: false,
+        error: 'Safety violation: test workflow equals prod workflow',
+        patch: null,
+        test_workflow_id: null,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    timings.lookup = Date.now() - startLookup;
+
+    // 7. Fetch current VN TEST workflow from n8n
+    const testWorkflowResult = await getWorkflow(connectionId, testWorkflowId);
+    if (testWorkflowResult.error || !testWorkflowResult.data) {
+      console.error('[assist/apply-step] Failed to fetch test workflow:', testWorkflowResult.error);
+      return res.status(500).json({
+        ok: false,
+        error: 'Failed to fetch test workflow from n8n',
+        patch: null,
+        test_workflow_id: testWorkflowId,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    const testWorkflow = testWorkflowResult.data;
+    const stepJson = stepRow.step_json as { title: string; nodeLocators: string[]; actions: string[]; expectedOutcome: string; checks: string[]; rollback?: string; rank: number; id: string };
+
+    // 8. Generate patch via LLM (temperature=0)
+    const startLlm = Date.now();
+    const patchPrompt = buildPatchPrompt({
+      id: stepJson.id,
+      title: stepJson.title,
+      nodeLocators: stepJson.nodeLocators || [],
+      actions: stepJson.actions || [],
+      expectedOutcome: stepJson.expectedOutcome || '',
+      checks: stepJson.checks || [],
+      rollback: stepJson.rollback,
+      rank: stepJson.rank || 0,
+    }, testWorkflow);
+
+    const llmResult = await callLLM({
+      messages: [
+        { role: 'system', content: 'You are an n8n workflow patcher. Output only valid JSON arrays.' },
+        { role: 'user', content: patchPrompt },
+      ],
+      temperature: APPLY_STEP_BUDGETS.temperature,
+      maxTokens: APPLY_STEP_BUDGETS.max_tokens,
+    });
+
+    timings.llm = Date.now() - startLlm;
+
+    if (!llmResult.ok) {
+      console.error('[assist/apply-step] LLM call failed:', llmResult.error);
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'LLM patch generation failed',
+        patch: null,
+        test_workflow_id: testWorkflowId,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // 9. Parse and validate patch
+    const patch = parsePatchResponse(llmResult.data.answer, stepId);
+    if (!patch) {
+      console.error('[assist/apply-step] Patch parsing failed');
+      timings.total = Date.now() - startTotal;
+      debug.timings_ms = timings;
+      return res.json({
+        ok: false,
+        error: 'Invalid patch format from LLM',
+        patch: null,
+        test_workflow_id: testWorkflowId,
+        diff_summary: null,
+        debug,
+      });
+    }
+
+    // 10. Compute diff summary
+    const diffSummary = computeDiffSummary(patch);
+
+    // 11. If dry_run=false, apply patch
+    let applyStatus = 'dry_run';
+    if (!dryRun) {
+      const startApply = Date.now();
+
+      // Apply patch to workflow (may throw if node type is invalid)
+      let patchedWorkflow: N8nWorkflow;
+      let appliedDiff: string;
+      try {
+        const result = applyPatchToWorkflow(testWorkflow, patch);
+        patchedWorkflow = result.workflow;
+        appliedDiff = result.diffSummary;
+      } catch (patchErr) {
+        const errMsg = patchErr instanceof Error ? patchErr.message : String(patchErr);
+        console.error('[assist/apply-step] Patch application failed:', errMsg);
+
+        timings.apply = Date.now() - startApply;
+        timings.total = Date.now() - startTotal;
+        debug.timings_ms = timings;
+
+        return res.status(400).json({
+          ok: false,
+          error: `Patch application failed: ${errMsg}`,
+          patch,
+          test_workflow_id: testWorkflowId,
+          diff_summary: null,
+          debug,
+        });
+      }
+
+      // Prepare valid n8n update payload (ensures active:false)
+      const updatePayload = prepareWorkflowForUpdate(patchedWorkflow);
+
+      // Add nodes preview for debugging (last 3 nodes with type info)
+      const nodesForPreview = patchedWorkflow.nodes?.slice(-3) || [];
+      debug.applied_nodes_preview = nodesForPreview.map(n => ({
+        name: n.name,
+        type: n.type,
+        typeVersion: n.typeVersion ?? 0,  // Default to 0 if undefined
+      }));
+
+      // Update test workflow in n8n
+      console.log(`[assist/apply-step] Sending update to n8n for workflow ${testWorkflowId}`, {
+        nodeCount: updatePayload.nodes?.length,
+        lastNodes: debug.applied_nodes_preview,
+      });
+      const updateResult = await updateWorkflow(connectionId, testWorkflowId, updatePayload);
+      timings.apply = Date.now() - startApply;
+
+      if (updateResult.error) {
+        const errDetails = updateResult.error;
+        console.error('[assist/apply-step] Failed to update test workflow:', errDetails);
+
+        // Sanitize error body (remove potential secrets)
+        const sanitizedBody = errDetails.details
+          ? errDetails.details.replace(/api[_-]?key[^"]*"[^"]+"/gi, 'api_key:"[REDACTED]"')
+          : undefined;
+
+        // Add apply_error to debug for transparency
+        debug.apply_error = {
+          status: errDetails.status || 500,
+          message: errDetails.message || 'Unknown error',
+          body: sanitizedBody?.slice(0, 500),  // Truncate to 500 chars
+        };
+
+        // Store failed audit record
+        const record = {
+          workflow_uuid: workflowId,
+          plan_id: planId,
+          step_id: stepId,
+          test_workflow_id: testWorkflowId,
+          patch_json: patch,
+          rollback_json: patch.rollback,
+          diff_summary: diffSummary,
+          status: 'failed',
+          error: `${errDetails.status}: ${errDetails.message}`,
+          idempotency_key: idempotency_key || null,
+          applied_by: 'assist/apply-step',
+        };
+
+        const { error: auditError } = await supabaseAdmin.from('step_applications').insert(record);
+
+        if (auditError) {
+          console.error('[assist/apply-step] Failed to write audit log:', auditError);
+          debug.audit_error = `Failed to persist audit log: ${JSON.stringify(auditError)}`;
+        }
+
+        timings.total = Date.now() - startTotal;
+        debug.timings_ms = timings;
+        return res.json({
+          ok: false,
+          error: `Failed to apply patch: ${errDetails.message}`,
+          patch,
+          test_workflow_id: testWorkflowId,
+          diff_summary: diffSummary,
+          debug,
+        });
+      }
+
+      applyStatus = 'applied';
+      console.log(`[assist/apply-step] Patch applied successfully: ${appliedDiff}`);
+
+      // Store successful audit record
+      const record = {
+        workflow_uuid: workflowId,
+        plan_id: planId,
+        step_id: stepId,
+        test_workflow_id: testWorkflowId,
+        patch_json: patch,
+        rollback_json: patch.rollback,
+        diff_summary: diffSummary,
+        status: 'applied',
+        error: null,
+        idempotency_key: idempotency_key || null,
+        applied_by: 'assist/apply-step',
+      };
+
+      const { error: auditError } = await supabaseAdmin.from('step_applications').insert(record);
+
+      if (auditError) {
+        console.error('[assist/apply-step] Failed to write audit log:', auditError);
+        debug.audit_error = `Failed to persist audit log: ${JSON.stringify(auditError)}`;
+      }
+
+      // Update step status
+      await supabaseAdmin
+        .from('completion_steps')
+        .update({ status: 'done' })
+        .eq('plan_id', planId)
+        .eq('step_id', stepId);
+    }
+
+
+
+    // 12. Return response
+    timings.total = Date.now() - startTotal;
+    debug.timings_ms = timings;
+
+    const response: ApplyStepResponse = {
+      ok: true,
+      patch,
+      test_workflow_id: testWorkflowId,
+      diff_summary: diffSummary,
+      debug,
+    };
+
+    console.log(`[assist/apply-step] Success in ${timings.total}ms, status=${applyStatus}, ops=${patch.operations.length}`);
+    res.json(response);
+
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    console.error('[assist/apply-step] error:', e);
+    res.status(500).json({
+      ok: false,
+      error: `Internal error: ${errMsg}`,
+      patch: null,
+      test_workflow_id: null,
+      diff_summary: null,
+      debug: createEmptyApplyStepDebug('', '', ''),
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Idempotency lookup (read-only, admin-token gated)
+// ═══════════════════════════════════════════════════════════════════
+router.get('/v3/assist/apply-step/idempotency/:key', async (req: Request, res: Response) => {
+  try {
+    // Auth: require VN_ADMIN_TOKEN header
+    const adminToken = process.env.VN_ADMIN_TOKEN;
+    const headerToken = req.headers['x-vn-admin-token'] as string | undefined;
+    if (!adminToken || headerToken !== adminToken) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    const key = req.params.key?.trim();
+    if (!key) {
+      return res.status(400).json({ ok: false, error: 'idempotency key is required' });
+    }
+
+    const { data: rows, error } = await supabaseAdmin
+      .from('step_applications')
+      .select('id, status, created_at, workflow_uuid, plan_id, step_id')
+      .eq('idempotency_key', key)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('[idempotency-lookup] DB error:', error);
+      return res.status(500).json({ ok: false, error: 'database error' });
+    }
+
+    const count = rows?.length ?? 0;
+    const latest = count > 0 ? rows![0] : null;
+
+    return res.json({ ok: true, count, latest });
+  } catch (e) {
+    console.error('[idempotency-lookup] error:', e);
+    return res.status(500).json({ ok: false, error: 'internal error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Sandbox reset (guarded, optional recreate, cooldown)
+// ═══════════════════════════════════════════════════════════════════
+const resetCooldowns = new Map<string, number>();
+
+router.post('/v3/workflows/:workflowUuid/sandbox/reset', async (req: Request, res: Response) => {
+  try {
+    const { workflowUuid } = req.params;
+    const { confirm, connectionId } = req.body;
+    const recreate = req.query.recreate === '1';
+
+    // 1. Validate confirm token
+    if (confirm !== 'RESET_VN_TEST') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Body must include { confirm: "RESET_VN_TEST" }',
+      });
+    }
+
+    if (!connectionId || typeof connectionId !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing connectionId in request body',
+      });
+    }
+
+    if (!workflowUuid || typeof workflowUuid !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing workflowUuid in URL path',
+      });
+    }
+
+    // 2. Cooldown check (10s per connectionId+workflowUuid)
+    const cooldownKey = `${connectionId}:${workflowUuid}`;
+    const lastReset = resetCooldowns.get(cooldownKey);
+    if (lastReset && Date.now() - lastReset < 10_000) {
+      return res.status(429).json({ ok: false, error: 'reset_cooldown' });
+    }
+
+    // 3. Auth: resolve user
+    const userId = await resolveUserIdForConnection(req, connectionId);
+    if (!userId) {
+      return res.status(403).json({ ok: false, error: 'Unauthorized or connection not found' });
+    }
+
+    // 4. Resolve n8n workflow ID (prod)
+    const resolveResult = await resolveN8nWorkflowId({
+      workflowId: workflowUuid,
+      connectionId,
+      userId,
+    });
+    if (resolveResult.ok === false) {
+      return res.status(404).json({ ok: false, error: resolveResult.error });
+    }
+    const prodN8nId = resolveResult.n8nWorkflowId;
+
+    // 5. Look up existing test workflow
+    const { data: existing, error: lookupError } = await supabaseAdmin
+      .from('vn_test_workflows')
+      .select('id, test_n8n_workflow_id')
+      .eq('user_id', userId)
+      .eq('connection_id', connectionId)
+      .eq('prod_workflow_uuid', workflowUuid)
+      .maybeSingle();
+
+    if (lookupError) {
+      console.error('[sandbox/reset] DB lookup error:', lookupError);
+      return res.status(500).json({ ok: false, error: 'database error' });
+    }
+
+    if (!existing) {
+      return res.status(404).json({ ok: false, error: 'No test workflow found for this workflow' });
+    }
+
+    // 6. Safety: refuse if test ID equals prod ID
+    if (existing.test_n8n_workflow_id === prodN8nId) {
+      console.error('[sandbox/reset] REFUSED: test_n8n_workflow_id equals prod_n8n_workflow_id');
+      return res.status(403).json({
+        ok: false,
+        error: 'SAFETY: test workflow ID matches production workflow ID. Refusing to delete.',
+      });
+    }
+
+    // 7. Delete n8n workflow
+    const deletedId = existing.test_n8n_workflow_id;
+    console.log(`[sandbox/reset] Deleting test workflow: ${deletedId}`);
+    await deleteWorkflow(connectionId, deletedId).catch((e) => {
+      console.error('[sandbox/reset] Failed to delete n8n workflow:', e instanceof Error ? e.message : e);
+    });
+
+    // 8. Delete DB row
+    const { error: deleteError } = await supabaseAdmin
+      .from('vn_test_workflows')
+      .delete()
+      .eq('id', existing.id);
+
+    if (deleteError) {
+      console.error('[sandbox/reset] Failed to delete DB record:', deleteError);
+    }
+
+    // Record cooldown
+    resetCooldowns.set(cooldownKey, Date.now());
+
+    console.log(`[sandbox/reset] Reset complete for ${workflowUuid}`);
+
+    // 9. Optional: recreate via internal fetch to sandbox/ensure
+    if (recreate) {
+      console.log('[sandbox/reset] recreate=1, calling sandbox/ensure internally...');
+      // Build internal request to sandbox/ensure
+      const ensureUrl = `http://127.0.0.1:${req.socket.localPort}/api/v3/workflows/${workflowUuid}/sandbox/ensure`;
+      const ensureRes = await fetch(ensureUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionId }),
+      });
+      const ensureData = await ensureRes.json() as {
+        ok: boolean;
+        testWorkflow?: { testN8nWorkflowId?: string; webhookUrl?: string };
+        error?: string;
+      };
+
+      if (ensureData.ok && ensureData.testWorkflow) {
+        return res.json({
+          ok: true,
+          deleted: deletedId,
+          recreated: true,
+          test_workflow_id: ensureData.testWorkflow.testN8nWorkflowId,
+          // Do NOT log webhook URL in response for safety; include for client use only
+          webhook_url: ensureData.testWorkflow.webhookUrl,
+        });
+      } else {
+        return res.json({
+          ok: true,
+          deleted: deletedId,
+          recreated: false,
+          recreate_error: ensureData.error || 'sandbox/ensure failed',
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      deleted: deletedId,
+      message: 'Reset complete. Call /sandbox/ensure to recreate.',
+    });
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    console.error('[sandbox/reset] error:', errMsg);
+    return res.status(500).json({ ok: false, error: `Internal error: ${errMsg}` });
   }
 });
 

@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "build-canonical": "ts-node scripts/build-canonical-n8n-nodes-base.ts",
-    "doctor": "ts-node scripts/doctor.ts"
+    "doctor": "ts-node scripts/doctor.ts",
+    "doctor:integration": "ts-node scripts/doctor.ts --integration",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [],
   "author": "",
@@ -26,6 +28,7 @@
     "n8n-core": "^1.122.1",
     "n8n-workflow": "^1.120.0",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "wait-on": "^7.2.0"
   }
 }
