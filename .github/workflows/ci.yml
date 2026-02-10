@@ -42,13 +42,7 @@ jobs:
     name: Doctor Integration
     runs-on: ubuntu-latest
     needs: check
-    if: >-
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
-      secrets.DOCTOR_CONNECTION_ID != '' &&
-      secrets.DOCTOR_WORKFLOW_UUID != '' &&
-      secrets.OPENAI_API_KEY != '' &&
-      secrets.SUPABASE_URL != '' &&
-      secrets.SUPABASE_SERVICE_ROLE_KEY != ''
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
     env:
       DOCTOR_INTEGRATION: "1"
       DOCTOR_CONNECTION_ID: ${{ secrets.DOCTOR_CONNECTION_ID }}
@@ -65,16 +59,40 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      # Guard: check required secrets and set output
+      - name: "Guard: required secrets"
+        id: guard
+        shell: bash
+        run: |
+          missing=0
+          for v in DOCTOR_CONNECTION_ID DOCTOR_WORKFLOW_UUID OPENAI_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!v}" ]; then
+              echo "::warning::Missing env $v - skipping integration."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "run_integration=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_integration=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - run: npm ci
+        if: steps.guard.outputs.run_integration == 'true'
+
       # Start API in background & wait for health
       - name: Start API
+        if: steps.guard.outputs.run_integration == 'true'
         # Pass secrets as env vars to the server process
         run: npm run dev > api.log 2>&1 &
       - name: Wait for API Health
+        if: steps.guard.outputs.run_integration == 'true'
         run: npx wait-on -t 60000 http://127.0.0.1:3000/api/v3/node-library/health
       # Run integration doctor against the running API
       - run: npm run doctor:integration
+        if: steps.guard.outputs.run_integration == 'true'
       # Dump logs if anything failed
       - name: Dump API Logs
-        if: failure()
+        if: failure() && steps.guard.outputs.run_integration == 'true'
         run: cat api.log
