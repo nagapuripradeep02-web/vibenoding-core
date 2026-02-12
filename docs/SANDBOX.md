@@ -251,3 +251,55 @@ Check that:
 - The production workflow exists
 - The n8n connection has valid API credentials
 - The user has access to the connection
+
+---
+
+## Sandbox Reset
+
+When a VN TEST workflow accumulates junk nodes from repeated apply-step testing, you can reset it to a clean state.
+
+### POST `/api/v3/workflows/:workflowUuid/sandbox/reset`
+
+**Request:**
+```json
+{
+  "confirm": "RESET_VN_TEST",
+  "connectionId": "uuid-of-n8n-connection"
+}
+```
+
+**Query params:**
+- `?recreate=1` — After deletion, automatically recreate a fresh test workflow
+
+**Response (without recreate):**
+```json
+{ "ok": true, "deleted": "old-n8n-id", "message": "Reset complete. Call /sandbox/ensure to recreate." }
+```
+
+**Response (with `?recreate=1`):**
+```json
+{ "ok": true, "deleted": "old-n8n-id", "recreated": true, "test_workflow_id": "new-n8n-id", "webhook_url": "https://..." }
+```
+
+### Safety Guards
+
+1. **Confirm token required** — Body must include `{ confirm: "RESET_VN_TEST" }`. Without it, the endpoint returns 400.
+2. **Prod protection** — Refuses with 403 if `test_n8n_workflow_id === prod_n8n_workflow_id`.
+3. **Auth** — Uses the same connection-based auth as sandbox/ensure.
+4. **Cooldown** — Returns 429 if called again within 10 seconds (same connectionId + workflowUuid).
+5. **Logs sanitized** — Webhook URLs and secrets are never logged.
+
+### When to Use
+
+- After many apply-step iterations leave junk nodes in the test workflow
+- When the test webhook stops responding (404) and `sandbox/ensure` can't self-heal
+- Before running doctor:integration to get a clean baseline
+
+### curl Example
+
+```bash
+# Reset and recreate in one call
+curl -X POST "http://localhost:3000/api/v3/workflows/{UUID}/sandbox/reset?recreate=1" \
+  -H "Content-Type: application/json" \
+  -d '{"confirm":"RESET_VN_TEST","connectionId":"YOUR_CONNECTION_ID"}'
+```

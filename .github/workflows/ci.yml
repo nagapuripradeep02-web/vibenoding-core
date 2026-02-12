@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly on Sunday at 06:00 UTC
+    - cron: "0 6 * * 0"
+
+jobs:
+  # ─── Always runs: typecheck + unit doctor ─────────────────
+  check:
+    name: Typecheck & Unit Doctor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Start API in background & wait for health
+      - name: Start API
+        run: npm run dev > api.log 2>&1 &
+        env:
+          NODE_LIBRARY_DEBUG: "1"
+          VN_RUNTIME: "ci"
+          OPENAI_API_KEY: "sk-dummy-key-for-ci-check"
+      - name: Wait for API Health
+        run: npx wait-on -t 60000 http-get://127.0.0.1:3000/api/v3/node-library/health
+      # Run unit doctor against the running API
+      - run: npm run doctor
+      # Dump logs if anything failed
+      - name: Dump API Logs
+        if: failure()
+        run: tail -n 200 api.log || true
+
+  # ─── Gated: integration doctor (requires secrets) ─────────
+  doctor-integration:
+    name: Doctor Integration
+    runs-on: ubuntu-latest
+    needs: check
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    env:
+      DOCTOR_INTEGRATION: "1"
+      DOCTOR_CONNECTION_ID: ${{ secrets.DOCTOR_CONNECTION_ID }}
+      DOCTOR_WORKFLOW_UUID: ${{ secrets.DOCTOR_WORKFLOW_UUID }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      VN_ADMIN_TOKEN: ${{ secrets.VN_ADMIN_TOKEN }}
+      # Required for server to function (sandbox/ensure, resolve)
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      NODE_LIBRARY_DEBUG: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Guard: check required secrets and set output
+      - name: "Guard: required secrets"
+        id: guard
+        shell: bash
+        run: |
+          missing=0
+          for v in DOCTOR_CONNECTION_ID DOCTOR_WORKFLOW_UUID OPENAI_API_KEY SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!v}" ]; then
+              echo "::warning::Missing env $v - skipping integration."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "run_integration=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_integration=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm ci
+        if: steps.guard.outputs.run_integration == 'true'
+
+      # Start API in background & wait for health
+      - name: Start API
+        if: steps.guard.outputs.run_integration == 'true'
+        # Pass secrets as env vars to the server process
+        run: npm run dev > api.log 2>&1 &
+      - name: Wait for API Health
+        if: steps.guard.outputs.run_integration == 'true'
+        run: npx wait-on -t 60000 http://127.0.0.1:3000/api/v3/node-library/health
+      # Run integration doctor against the running API
+      - run: npm run doctor:integration
+        if: steps.guard.outputs.run_integration == 'true'
+      # Dump logs if anything failed
+      - name: Dump API Logs
+        if: failure() && steps.guard.outputs.run_integration == 'true'
+        run: cat api.log

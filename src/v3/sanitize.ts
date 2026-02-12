@@ -32,7 +32,7 @@ function sanitizeInner(value: unknown, opts: Required<SanitizeOptions>, depth: n
   if (depth > opts.maxDepth) return '[TRUNCATED_DEPTH]';
 
   const t = typeof value;
-  if (t === 'string') return truncateString(redactString(value), opts.maxStringLength);
+  if (t === 'string') return truncateString(redactString(value as string), opts.maxStringLength);
   if (t === 'number' || t === 'boolean') return value;
 
   if (Array.isArray(value)) {

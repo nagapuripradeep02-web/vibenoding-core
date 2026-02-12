@@ -38,7 +38,7 @@ app.use((req: Request, res: Response, next) => {
     res.header('Vary', 'Origin');
   } else {
     // Non-browser or unknown origin (curl/postman) — keep permissive for dev
-  res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Origin', '*');
   }
 
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -76,50 +76,50 @@ async function getN8nConnection(connectionId?: string): Promise<ConnectionResult
 
     if (dbError) {
       console.error('Database error fetching connection:', dbError);
-      return { 
-        error: { 
-          status: 404, 
-          message: connectionId ? `Connection not found: ${dbError.message}` : `No n8n connection found: ${dbError.message}` 
-        } 
+      return {
+        error: {
+          status: 404,
+          message: connectionId ? `Connection not found: ${dbError.message}` : `No n8n connection found: ${dbError.message}`
+        }
       };
     }
 
     if (!connection) {
       console.error('No connection data returned from database');
-      return { 
-        error: { 
-          status: 404, 
-          message: connectionId ? 'Connection not found' : 'No n8n connection found' 
-        } 
+      return {
+        error: {
+          status: 404,
+          message: connectionId ? 'Connection not found' : 'No n8n connection found'
+        }
       };
     }
 
     if (!connection.base_url || !connection.api_key_encrypted) {
-      console.error('Connection missing required fields:', { 
-        hasBaseUrl: !!connection.base_url, 
-        hasApiKey: !!connection.api_key_encrypted 
+      console.error('Connection missing required fields:', {
+        hasBaseUrl: !!connection.base_url,
+        hasApiKey: !!connection.api_key_encrypted
       });
-      return { 
-        error: { 
-          status: 400, 
-          message: 'Connection is missing required fields (base_url or api_key_encrypted)' 
-        } 
+      return {
+        error: {
+          status: 400,
+          message: 'Connection is missing required fields (base_url or api_key_encrypted)'
+        }
       };
     }
 
-    console.log('Successfully fetched connection:', { 
-      id: connection.id, 
-      baseUrl: connection.base_url 
+    console.log('Successfully fetched connection:', {
+      id: connection.id,
+      baseUrl: connection.base_url
     });
     return { connection: { base_url: connection.base_url, api_key_encrypted: connection.api_key_encrypted } };
   } catch (error) {
     console.error('Unexpected error in getN8nConnection:', error);
     const message = error instanceof Error ? error.message : 'Unknown error';
-    return { 
-      error: { 
-        status: 500, 
-        message: `Failed to fetch connection: ${message}` 
-      } 
+    return {
+      error: {
+        status: 500,
+        message: `Failed to fetch connection: ${message}`
+      }
     };
   }
 }
@@ -219,10 +219,10 @@ async function listN8nWorkflows(connectionId: string): Promise<ListWorkflowsResu
     }
 
     const data = await n8nResponse.json() as unknown[] | { data?: unknown[] };
-    
+
     // Handle both array response and { data: [...] } response format
     const workflowsArray = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);
-    
+
     // Map to simplified format
     const simplified: SimplifiedWorkflow[] = workflowsArray.map((wf: any) => ({
       id: String(wf.id || ''),
@@ -418,9 +418,9 @@ app.get('/api/n8n/workflows', async (req: Request, res: Response) => {
     const message = error instanceof Error ? error.message : 'Unknown error';
     const stack = error instanceof Error ? error.stack : undefined;
     console.error('Error stack:', stack);
-    res.status(500).json({ 
-      error: 'Failed to fetch workflows from n8n', 
-      details: message 
+    res.status(500).json({
+      error: 'Failed to fetch workflows from n8n',
+      details: message
     });
   }
 });
@@ -429,7 +429,7 @@ app.get('/api/n8n/workflows', async (req: Request, res: Response) => {
 app.get('/api/n8n/workflows/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    
+
     if (!id || id.trim() === '') {
       return res.status(400).json({ error: 'Missing id parameter' });
     }
@@ -814,9 +814,9 @@ app.post('/api/n8n/chat', async (req: Request, res: Response) => {
 
     // Validate required parameters
     if (!connectionId || !workflowId || !message) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Missing required fields',
-        details: 'connectionId, workflowId, and message are required' 
+        details: 'connectionId, workflowId, and message are required'
       });
     }
 
@@ -852,9 +852,9 @@ app.post('/api/n8n/chat', async (req: Request, res: Response) => {
     }
 
     const message = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).json({ 
-      error: 'Failed to process chat message', 
-      details: message 
+    res.status(500).json({
+      error: 'Failed to process chat message',
+      details: message
     });
   }
 });
@@ -867,9 +867,9 @@ app.get('/api/n8n/chat', async (req: Request, res: Response) => {
 
     // Validate required parameters
     if (!connectionId || !workflowId || !message) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Missing required query parameters',
-        details: 'connectionId, workflowId, and message are required' 
+        details: 'connectionId, workflowId, and message are required'
       });
     }
 
@@ -905,9 +905,9 @@ app.get('/api/n8n/chat', async (req: Request, res: Response) => {
     }
 
     const message = error instanceof Error ? error.message : 'Unknown error';
-    res.status(500).json({ 
-      error: 'Failed to process chat message', 
-      details: message 
+    res.status(500).json({
+      error: 'Failed to process chat message',
+      details: message
     });
   }
 });
@@ -1009,6 +1009,15 @@ app.get('/api/n8n/complete', async (req: Request, res: Response) => {
 // Simple health check (root level)
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok' });
+});
+
+// Catch-all error middleware (must have 4 params for Express to treat as error handler)
+app.use((err: any, _req: Request, res: Response, _next: any) => {
+  const status = err.statusCode || 500;
+  res.status(status).json({
+    ok: false,
+    error: err.message || 'internal_error',
+  });
 });
 
 // Start server
