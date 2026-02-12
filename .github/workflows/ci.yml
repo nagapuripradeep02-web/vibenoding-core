@@ -28,14 +28,16 @@ jobs:
         run: npm run dev > api.log 2>&1 &
         env:
           NODE_LIBRARY_DEBUG: "1"
+          VN_RUNTIME: "ci"
+          OPENAI_API_KEY: "sk-dummy-key-for-ci-check"
       - name: Wait for API Health
-        run: npx wait-on -t 60000 http://127.0.0.1:3000/api/v3/node-library/health
+        run: npx wait-on -t 60000 http-get://127.0.0.1:3000/api/v3/node-library/health
       # Run unit doctor against the running API
       - run: npm run doctor
       # Dump logs if anything failed
       - name: Dump API Logs
         if: failure()
-        run: cat api.log
+        run: tail -n 200 api.log || true
 
   # ─── Gated: integration doctor (requires secrets) ─────────
   doctor-integration:

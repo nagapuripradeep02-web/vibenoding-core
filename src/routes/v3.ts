@@ -4,7 +4,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { supabaseAdmin } from '../lib/supabase';
+import { supabaseAdmin, supabaseConfigured } from '../lib/supabase';
 import {
   getWorkflow,
   getExecution,
@@ -1552,6 +1552,7 @@ router.get('/v3/node-library/health', (_req: Request, res: Response) => {
     ok: true,
     service: 'vibenoding-core',
     ts: Date.now(),
+    supabase_configured: supabaseConfigured,
   });
 });
 
