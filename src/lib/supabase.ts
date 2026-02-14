@@ -1,10 +1,33 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Canonical name; also accept legacy SUPABASE_SERVICE_KEY for backward compat
+const supabaseServiceRoleKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
 const VN_RUNTIME = process.env.VN_RUNTIME || 'prod';
 
 export const supabaseConfigured: boolean = !!(supabaseUrl && supabaseServiceRoleKey);
+
+/** Decode JWT payload role (no verification, just base64) — never leaks the secret */
+function decodeJwtRole(jwt: string | undefined): string {
+  if (!jwt) return 'missing';
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64').toString());
+    return payload.role || 'unknown';
+  } catch { return 'invalid'; }
+}
+
+export const supabaseRole: string = decodeJwtRole(supabaseServiceRoleKey);
+
+// Startup diagnostics (safe — no secrets logged)
+console.log(`[supabase] configured=${supabaseConfigured} role=${supabaseRole} runtime=${VN_RUNTIME}`);
+
+if (supabaseConfigured && supabaseRole !== 'service_role') {
+  console.warn(
+    `[supabase] ⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY has role="${supabaseRole}", expected "service_role".\n` +
+    `  This will cause RLS errors on INSERT/UPDATE. Check your .env file.`
+  );
+}
 
 // Prod: fail fast at boot. CI: defer to request time.
 if (!supabaseConfigured && VN_RUNTIME !== 'ci') {

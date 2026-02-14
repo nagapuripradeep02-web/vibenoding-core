@@ -17,8 +17,12 @@
  */
 
 import 'dotenv/config';
+import { spawn, execSync, ChildProcess } from 'child_process';
 
-const BASE_URL = process.env.DOCTOR_BASE_URL || 'http://127.0.0.1:3000';
+let serverProcess: ChildProcess | null = null;
+
+const PORT = process.env.PORT || '3000';
+const BASE_URL = process.env.DOCTOR_BASE_URL || `http://127.0.0.1:${PORT}`;
 const WORKFLOW_UUID = process.env.DOCTOR_WORKFLOW_UUID;
 const CONNECTION_ID = process.env.DOCTOR_CONNECTION_ID;
 const INTEGRATION = process.argv.includes('--integration') || process.env.DOCTOR_INTEGRATION === '1';
@@ -88,6 +92,40 @@ async function checkHealth(): Promise<boolean> {
     console.log(`   Error: ${e instanceof Error ? e.message : String(e)}`);
     return false;
   }
+}
+
+async function startApiServer(): Promise<boolean> {
+  const cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
+  // Use stdio: 'inherit' to show API logs to user (helpful for debugging startup)
+  serverProcess = spawn(cmd, ['run', 'start:doctor'], {
+    stdio: 'inherit',
+    shell: true,
+    env: { ...process.env }
+  });
+
+  console.log('Waiting for API to be ready...');
+
+  // Poll for health (up to 30 seconds)
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      // Use a short timeout for the dry run to avoid hanging
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1000);
+
+      const res = await fetch(`${BASE_URL}${ENDPOINTS.health}`, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (res.status === 200) {
+        console.log(`\n${GREEN}API server started and healthy.${RESET}`);
+        return true;
+      }
+    } catch {
+      process.stdout.write('.');
+    }
+  }
+  return false;
 }
 
 function printEndpoints(): void {
@@ -1072,6 +1110,52 @@ async function testAssistApplyStep(): Promise<boolean> {
           fail('Idempotent response differs from original');
           allPass = false;
         }
+
+        // Step 4a: Verify enriched debug fields (Cursor-like explainability)
+        console.log('\n  Step 4a: Verifying enriched idempotency debug fields...');
+
+        // workflow_uuid, plan_id, step_id should be filled from request
+        if (retryData.debug.workflow_uuid === WORKFLOW_UUID) {
+          pass(`debug.workflow_uuid filled: ${retryData.debug.workflow_uuid.slice(0, 8)}...`);
+        } else {
+          fail(`debug.workflow_uuid missing or wrong: "${retryData.debug.workflow_uuid}"`);
+          allPass = false;
+        }
+        if (retryData.debug.plan_id === planId) {
+          pass(`debug.plan_id filled: ${retryData.debug.plan_id.slice(0, 8)}...`);
+        } else {
+          fail(`debug.plan_id missing or wrong: "${retryData.debug.plan_id}"`);
+          allPass = false;
+        }
+        if (retryData.debug.step_id === stepId) {
+          pass(`debug.step_id filled: ${retryData.debug.step_id}`);
+        } else {
+          fail(`debug.step_id missing or wrong: "${retryData.debug.step_id}"`);
+          allPass = false;
+        }
+
+        // test_workflow_id should be present (from vn_test_workflows lookup)
+        if (retryData.debug.test_workflow_id) {
+          pass(`debug.test_workflow_id enriched: ${retryData.debug.test_workflow_id}`);
+        } else {
+          warn('debug.test_workflow_id empty (lookup may have failed)');
+        }
+
+        // prod_workflow_id_DENIED should be present (from workflowIdBridge)
+        if (retryData.debug.prod_workflow_id_DENIED) {
+          pass(`debug.prod_workflow_id_DENIED enriched: ${retryData.debug.prod_workflow_id_DENIED}`);
+        } else {
+          warn('debug.prod_workflow_id_DENIED empty (resolve may have failed)');
+        }
+
+        // timings_ms.total should be > 0
+        const totalMs = (retryData.debug as any).timings_ms?.total;
+        if (typeof totalMs === 'number' && totalMs > 0) {
+          pass(`debug.timings_ms.total > 0: ${totalMs}ms`);
+        } else {
+          warn(`debug.timings_ms.total not populated: ${totalMs}`);
+        }
+
       } else {
         fail(`Idempotency check failed:
     - ok: ${retryData.ok}
@@ -1139,10 +1223,17 @@ async function main(): Promise<void> {
   let exitCode = 0;
 
   // ── Unit checks (always run) ──────────────────────────────
-  const healthOk = await checkHealth();
+  let healthOk = await checkHealth();
+
   if (!healthOk) {
-    console.log('\nBackend not reachable. Start it with: npm run dev\n');
-    process.exit(1);
+    console.log('\nBackend not reachable. Attempting to start API via "npm run start:doctor"...');
+    const started = await startApiServer();
+    if (!started) {
+      console.log('\nFailed to start API server. Please check logs above.');
+      process.exit(1);
+    }
+    // Re-check health (or just assume true since startApiServer waits for it)
+    healthOk = true;
   }
 
   printEndpoints();
@@ -1232,6 +1323,19 @@ async function main(): Promise<void> {
     ? `\n${GREEN}All checks passed!${RESET}\n`
     : `\n${RED}Some checks failed.${RESET}\n`);
 
+  // Ensure server process is killed on exit
+  if (serverProcess) {
+    console.log('\nStopping API server...');
+    try {
+      if (process.platform === 'win32' && serverProcess.pid) {
+        execSync(`taskkill /pid ${serverProcess.pid} /f /t`, { stdio: 'ignore' });
+      } else {
+        serverProcess.kill();
+      }
+    } catch (e) {
+      // Ignore errors if process is already dead
+    }
+  }
   process.exit(exitCode);
 }
 

@@ -16,7 +16,7 @@ const DEFAULTS: Required<SanitizeOptions> = {
 
 const SECRET_KEY_RE = /(secret|token|api[_-]?key|password|authorization|cookie|set-cookie|client_secret|access[_-]?token|refresh[_-]?token)/i;
 
-function truncateString(s: string, max: number): string {
+function truncateStringSafe(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max)}â€¦(truncated ${s.length - max} chars)`;
 }
@@ -32,7 +32,7 @@ function sanitizeInner(value: unknown, opts: Required<SanitizeOptions>, depth: n
   if (depth > opts.maxDepth) return '[TRUNCATED_DEPTH]';
 
   const t = typeof value;
-  if (t === 'string') return truncateString(redactString(value as string), opts.maxStringLength);
+  if (t === 'string') return truncateStringSafe(redactString(value as string), opts.maxStringLength);
   if (t === 'number' || t === 'boolean') return value;
 
   if (Array.isArray(value)) {
@@ -79,7 +79,7 @@ export function sanitizeForResponse(value: unknown, options?: SanitizeOptions): 
   try {
     const json = JSON.stringify(sanitized);
     if (Buffer.byteLength(json, 'utf8') <= opts.maxBytes) return sanitized;
-    const truncated = truncateString(json, opts.maxBytes);
+    const truncated = truncateStringSafe(json, opts.maxBytes);
     return { _truncated_json: truncated };
   } catch {
     return '[UNSERIALIZABLE]';

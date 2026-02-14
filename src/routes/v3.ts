@@ -4,7 +4,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { supabaseAdmin, supabaseConfigured } from '../lib/supabase';
+import { supabaseAdmin, supabaseConfigured, supabaseRole } from '../lib/supabase';
 import {
   getWorkflow,
   getExecution,
@@ -1553,6 +1553,7 @@ router.get('/v3/node-library/health', (_req: Request, res: Response) => {
     service: 'vibenoding-core',
     ts: Date.now(),
     supabase_configured: supabaseConfigured,
+    supabase_role: supabaseRole,
   });
 });
 
@@ -4587,6 +4588,77 @@ router.post('/v3/assist/apply-step', async (req: Request, res: Response) => {
       if (existingApp) {
         console.log(`[assist/apply-step] Idempotency hit: key=${idempotency_key}, existing_id=${existingApp.id}`);
 
+        // ── Best-effort enrichment of debug fields ──────────────────
+        // These lookups NEVER cause the request to fail; on error we
+        // leave the field empty and add a debug.note.
+        const enrichStart = Date.now();
+        const enrichNotes: string[] = [];
+
+        // 1. Resolve prod workflow ID (DENIED — we never write to it)
+        let enrichedProdId = existingApp.test_workflow_id ? '' : '';
+        try {
+          const userId = await getConnectionUserId(connectionId);
+          if (userId) {
+            const resolveResult = await resolveN8nWorkflowId({
+              workflowId,
+              connectionId,
+              userId,
+            });
+            if (resolveResult.ok) {
+              enrichedProdId = resolveResult.n8nWorkflowId;
+            } else {
+              enrichNotes.push('prod_resolve_failed');
+            }
+          } else {
+            enrichNotes.push('user_lookup_failed');
+          }
+        } catch (e) {
+          enrichNotes.push('prod_resolve_error');
+        }
+
+        // 2. Look up test_workflow_id from vn_test_workflows
+        let enrichedTestId = existingApp.test_workflow_id || '';
+        if (!enrichedTestId) {
+          try {
+            const userId = await getConnectionUserId(connectionId);
+            if (userId) {
+              const { data: testRow } = await supabaseAdmin
+                .from('vn_test_workflows')
+                .select('test_n8n_workflow_id')
+                .eq('connection_id', connectionId)
+                .eq('prod_workflow_uuid', workflowId)
+                .maybeSingle();
+              enrichedTestId = testRow?.test_n8n_workflow_id || '';
+              if (!enrichedTestId) enrichNotes.push('test_workflow_not_found');
+            }
+          } catch (e) {
+            enrichNotes.push('test_lookup_error');
+          }
+        }
+
+        const enrichMs = Date.now() - enrichStart;
+        // ── End enrichment ──────────────────────────────────────────
+
+        // Build enriched debug object
+        const enrichedDebug: typeof debug = {
+          ...debug,
+          test_workflow_id: enrichedTestId,
+          prod_workflow_id_DENIED: enrichedProdId,
+          idempotency_hit: true,
+          idempotency_key,
+          existing_application_id: existingApp.id,
+          dry_run: dryRun,
+          timings_ms: {
+            total: Date.now() - startTotal,
+            lookup: enrichMs,
+            llm: 0,
+            apply: 0,
+          },
+        };
+        if (enrichNotes.length > 0) {
+          enrichedDebug.note = enrichNotes.join(', ');
+        }
+
         // Validate metadata matches
         if (
           existingApp.workflow_uuid !== workflowId ||
@@ -4602,34 +4674,22 @@ router.post('/v3/assist/apply-step', async (req: Request, res: Response) => {
             ok: false,
             error: 'Idempotency key already used with different workflow/plan/step',
             patch: null,
-            test_workflow_id: existingApp.test_workflow_id,
+            test_workflow_id: enrichedTestId || null,
             diff_summary: null,
-            debug: {
-              ...debug,
-              idempotency_hit: true,
-              idempotency_key,
-              existing_application_id: existingApp.id,
-              dry_run: dryRun,
-            },
+            debug: { ...enrichedDebug, cached_status: existingApp.status },
           });
         }
 
         // Return cached result based on status
         const isSuccess = existingApp.status === 'applied';
+        console.log(`[assist/apply-step] Returning cached result: status=${existingApp.status}, enrichMs=${enrichMs}ms`);
         return res.json({
           ok: isSuccess,
           error: isSuccess ? undefined : existingApp.error || 'Previous application failed',
           patch: existingApp.patch_json,
-          test_workflow_id: existingApp.test_workflow_id,
+          test_workflow_id: enrichedTestId || existingApp.test_workflow_id,
           diff_summary: existingApp.diff_summary,
-          debug: {
-            ...debug,
-            idempotency_hit: true,
-            idempotency_key,
-            existing_application_id: existingApp.id,
-            cached_status: existingApp.status,
-            dry_run: dryRun,
-          },
+          debug: { ...enrichedDebug, cached_status: existingApp.status },
         });
       }
     }

@@ -458,13 +458,30 @@ if (failedNode === 'Unknown') {
 - ✅ Safety guardrails
 - ✅ Doctor test
 
-### Phase 2B (Plan Mode)
-- ✅ Plan mode endpoint (`/api/v3/assist/plan`)
-- ✅ Structured fix plans with phases and steps
-- ✅ DB persistence (completion_plans, completion_steps)
-- ✅ Deterministic mode (temperature=0)
-- ✅ Server-generated plan IDs (security)
-- ✅ Doctor test for Plan endpoint
+### Phase 2B Step 2 (Apply-Step)
+- ✅ Apply-step endpoint (`/api/v3/assist/apply-step`)
+- ✅ Whitelisted patch operations (update_node_params, add_node, add_edge, set_credential_ref)
+- ✅ Safety: never writes to prod workflow (`debug.prod_workflow_id_DENIED`)
+- ✅ Idempotency support via `idempotency_key`
+- ✅ Rollback generation for add_node and add_edge
+- ✅ **Enriched idempotency-hit responses** (Cursor-like explainability)
+- ✅ Doctor test for idempotency enrichment
+
+#### Debug Fields (apply-step)
+
+| Field | Description |
+|---|---|
+| `workflow_uuid` | The workflow UUID from the request |
+| `plan_id` | The plan ID being applied |
+| `step_id` | The specific step being applied |
+| `test_workflow_id` | The n8n test workflow ID (from `vn_test_workflows`) |
+| `prod_workflow_id_DENIED` | The prod n8n workflow ID — **never written to** |
+| `dry_run` | Whether this was a dry run |
+| `timings_ms` | `{ total, lookup, llm, apply }` breakdown in ms |
+| `idempotency_key` | Echo of the key sent in request |
+| `idempotency_hit` | `true` if result came from cache |
+| `cached_status` | On hit: original application status (`applied`/`failed`) |
+| `note` | Best-effort enrichment notes (e.g. `prod_resolve_failed`) |
 
 ### Phase 3 (Future)
 - [ ] Citations (extract node names mentioned in answers)

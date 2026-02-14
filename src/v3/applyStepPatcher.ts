@@ -10,6 +10,7 @@
 
 import type { PlanStep } from './planContract';
 import type { NodePatch, ApplyStepPatch } from './applyStepContract';
+import type { PatchOp } from './applyStepContract';
 import { VALID_PATCH_OPS, validatePatchOperations } from './applyStepContract';
 import type { N8nWorkflow, N8nNode } from './types';
 import { randomUUID } from 'crypto';
@@ -402,11 +403,49 @@ export function parsePatchResponse(llmOutput: string, stepId: string): ApplyStep
 
 /**
  * Build rollback operations (inverse of patch)
+ * Only generates rollback for operations with clean inverses:
+ *   add_node → remove_node (by nodeName)
+ *   add_edge → remove_edge (by fromNode/toNode)
+ * Unsupported ops (update_node_params, set_credential_ref) are skipped
+ * because they'd need original-state capture to reverse.
  */
 function buildRollbackOperations(operations: NodePatch[]): NodePatch[] {
-    // For now, return empty array - rollback requires knowing original state
-    // In a full implementation, we'd capture original values before patching
-    return [];
+    const rollback: NodePatch[] = [];
+
+    for (const op of operations) {
+        switch (op.op) {
+            case 'add_node': {
+                // Rollback: remove the node by its name
+                const nodeName = op.nodeName || op.parameters?.name as string | undefined;
+                if (nodeName) {
+                    rollback.push({
+                        op: 'add_node' as PatchOp,
+                        nodeName,
+                        // Store as a marker for the rollback executor
+                        parameters: { _rollback_action: 'remove_node' },
+                    });
+                }
+                break;
+            }
+            case 'add_edge': {
+                // Rollback: remove the edge between the same nodes
+                if (op.fromNode && op.toNode) {
+                    rollback.push({
+                        op: 'add_edge' as PatchOp, // re-use type; semantically it's a remove
+                        fromNode: op.fromNode,
+                        toNode: op.toNode,
+                        parameters: { _rollback_action: 'remove_edge' },
+                    });
+                }
+                break;
+            }
+            // update_node_params and set_credential_ref need original state → skip
+            default:
+                break;
+        }
+    }
+
+    return rollback;
 }
 
 /**

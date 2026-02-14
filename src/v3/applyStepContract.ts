@@ -92,6 +92,7 @@ export interface ApplyStepDebug {
     existing_application_id?: string;
     cached_status?: string;
     audit_error?: string; // Captures write failures (upsert/idempotency)
+    note?: string;        // Best-effort enrichment notes (e.g. "prod_resolve_failed")
 }
 
 /**
